@@ -1,0 +1,114 @@
+<?xml version="1.0" ?>
+<!--
+  Quadcopter model for MuJoCo >= 3.0
+
+  Thrust is applied via xfrc_applied in Python (external forces on the main body).
+  The rotor joints are purely cosmetic — they let the props spin visually.
+
+  Motor layout (X configuration, viewed from above):
+      FL (-x, +y)    FR (+x, +y)
+      BL (-x, -y)    BR (+x, -y)
+
+  Spin directions (for yaw torque):
+      FL: CCW (+Z)   FR: CW  (-Z)
+      BL: CW  (-Z)   BR: CCW (+Z)
+-->
+<mujoco model="quadcopter">
+
+  <!-- angle="radian" is default in MJ3; coordinate="local" is removed — omit it -->
+  <!-- inertiafromgeom="auto": use explicit <inertial> when present, geom-derived otherwise -->
+  <compiler inertiafromgeom="auto"/>
+
+  <option timestep="0.001" gravity="0 0 -9.81" integrator="RK4"/>
+
+  <visual>
+    <!-- Clean up the default scene: no contact forces, subtle shadows -->
+    <headlight ambient="0.4 0.4 0.4" diffuse="0.6 0.6 0.6" specular="0.1 0.1 0.1"/>
+    <map shadowclip="1" shadowscale="0.6"/>
+    <quality shadowsize="2048"/>
+    <global offwidth="1280" offheight="720"/>
+  </visual>
+
+  <asset>
+    <!-- Simple gradient sky -->
+    <texture name="skybox" type="skybox" builtin="gradient"
+             rgb1="0.4 0.6 0.8" rgb2="0.8 0.9 1.0" width="512" height="512"/>
+    <!-- Tiled ground -->
+    <texture name="tex_ground" type="2d" builtin="checker"
+             rgb1="0.45 0.45 0.45" rgb2="0.55 0.55 0.55" width="512" height="512"/>
+    <material name="mat_ground" texture="tex_ground" texrepeat="8 8"
+              specular="0.1" shininess="0.1" reflectance="0.0"/>
+    <material name="mat_body"   rgba="0.15 0.20 0.80 1" specular="0.5" shininess="0.7"/>
+    <material name="mat_arm"    rgba="0.20 0.20 0.20 1" specular="0.2"/>
+    <material name="mat_motor"  rgba="0.10 0.10 0.10 1" specular="0.3"/>
+    <material name="mat_rotor"  rgba="0.85 0.15 0.15 0.75" specular="0.2"/>
+  </asset>
+
+  <worldbody>
+    <!-- Ground plane -->
+    <geom name="ground" type="plane" size="20 20 0.1" material="mat_ground" pos="0 0 0"/>
+
+    <!-- ================================================================
+         Main quadcopter body
+         freejoint gives it 6 DOF: qpos[0:3]=xyz, qpos[3:7]=quat(w,x,y,z)
+                                   qvel[0:3]=linear vel, qvel[3:6]=angular vel
+         ================================================================ -->
+    <body name="body" pos="0 0 0.5">
+      <freejoint name="root"/>
+
+      <!-- Central fuselage -->
+      <inertial pos="0 0 0" mass="1.0" diaginertia="0.0082 0.0082 0.0149"/>
+      <geom name="body_geom" type="box" size="0.08 0.08 0.04" material="mat_body"/>
+
+      <!-- Arms (purely visual) -->
+      <geom name="arm_fl_br" type="box" size="0.17 0.015 0.008" euler="0 0  0.7854" material="mat_arm"/>
+      <geom name="arm_fr_bl" type="box" size="0.17 0.015 0.008" euler="0 0 -0.7854" material="mat_arm"/>
+
+      <!-- ---- Front-Left motor + rotor ---- -->
+      <body name="motor_fl" pos="-0.17 0.17 0.0">
+        <inertial pos="0 0 0" mass="0.05" diaginertia="1e-4 1e-4 1e-4"/>
+        <geom name="motor_fl_geom" type="cylinder" size="0.016 0.02" material="mat_motor"/>
+        <!-- Rotor hinge: cosmetic spin only, driven by actuator -->
+        <joint name="rotor_fl" type="hinge" axis="0 0 1" limited="false" damping="1e-4"/>
+        <geom name="prop_fl" type="cylinder" size="0.115 0.003" pos="0 0 0.022" material="mat_rotor"/>
+      </body>
+
+      <!-- ---- Front-Right motor + rotor ---- -->
+      <body name="motor_fr" pos="0.17 0.17 0.0">
+        <inertial pos="0 0 0" mass="0.05" diaginertia="1e-4 1e-4 1e-4"/>
+        <geom name="motor_fr_geom" type="cylinder" size="0.016 0.02" material="mat_motor"/>
+        <joint name="rotor_fr" type="hinge" axis="0 0 1" limited="false" damping="1e-4"/>
+        <geom name="prop_fr" type="cylinder" size="0.115 0.003" pos="0 0 0.022" material="mat_rotor"/>
+      </body>
+
+      <!-- ---- Back-Left motor + rotor ---- -->
+      <body name="motor_bl" pos="-0.17 -0.17 0.0">
+        <inertial pos="0 0 0" mass="0.05" diaginertia="1e-4 1e-4 1e-4"/>
+        <geom name="motor_bl_geom" type="cylinder" size="0.016 0.02" material="mat_motor"/>
+        <joint name="rotor_bl" type="hinge" axis="0 0 1" limited="false" damping="1e-4"/>
+        <geom name="prop_bl" type="cylinder" size="0.115 0.003" pos="0 0 0.022" material="mat_rotor"/>
+      </body>
+
+      <!-- ---- Back-Right motor + rotor ---- -->
+      <body name="motor_br" pos="0.17 -0.17 0.0">
+        <inertial pos="0 0 0" mass="0.05" diaginertia="1e-4 1e-4 1e-4"/>
+        <geom name="motor_br_geom" type="cylinder" size="0.016 0.02" material="mat_motor"/>
+        <joint name="rotor_br" type="hinge" axis="0 0 1" limited="false" damping="1e-4"/>
+        <geom name="prop_br" type="cylinder" size="0.115 0.003" pos="0 0 0.022" material="mat_rotor"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <!--
+    Actuators drive the rotor hinges for visual prop spin only.
+    Actual thrust forces are injected via xfrc_applied in Python.
+    gear scales ctrl -> torque; small value keeps spin speed reasonable.
+  -->
+  <actuator>
+    <motor name="act_fl" joint="rotor_fl" gear="0.01" ctrlrange="-1 1"/>
+    <motor name="act_fr" joint="rotor_fr" gear="0.01" ctrlrange="-1 1"/>
+    <motor name="act_bl" joint="rotor_bl" gear="0.01" ctrlrange="-1 1"/>
+    <motor name="act_br" joint="rotor_br" gear="0.01" ctrlrange="-1 1"/>
+  </actuator>
+
+</mujoco>

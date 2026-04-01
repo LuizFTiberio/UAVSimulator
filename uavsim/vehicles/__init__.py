@@ -1,0 +1,1 @@
+"""Vehicle definitions (multirotors, VTOLs)."""

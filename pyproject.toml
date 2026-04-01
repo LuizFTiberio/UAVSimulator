@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uavsim"
+version = "0.1.0"
+description = "JAX-first UAV simulator with MuJoCo physics"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "jax>=0.4.20",
+    "jaxlib>=0.4.20",
+    "mujoco>=3.0.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+viz = ["matplotlib>=3.6.0"]
+rl = ["gymnasium>=0.29.0"]
+dev = ["pytest>=7.0"]
+all = ["uavsim[viz,rl,dev]"]
+
+[tool.setuptools.packages.find]
+include = ["uavsim*"]
+
+[tool.setuptools.package-data]
+uavsim = ["models/*.xml"]
