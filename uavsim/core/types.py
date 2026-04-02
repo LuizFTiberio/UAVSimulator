@@ -69,3 +69,41 @@ class HoverGains(NamedTuple):
     max_tilt: float                  # maximum tilt angle [rad]
     min_alt: float                   # minimum altitude [m]
     min_thrust_ratio: float          # minimum thrust as fraction of hover [0-1]
+
+
+# ── wing / aerodynamic parameters ────────────────────────────────────────────
+
+class WingParams(NamedTuple):
+    """Aerodynamic parameters for a fixed wing."""
+    wingspan: float                # wing span [m]
+    aspect_ratio: float            # AR = b² / S
+    wing_area: float               # S [m²]
+    rho: float                     # air density [kg/m³]
+    CL0: float                     # zero-AoA lift coefficient
+    CLa: float                     # lift-curve slope [1/rad]
+    CD0: float                     # zero-lift drag coefficient
+    oswald: float                  # Oswald efficiency factor
+    alpha_max: float               # stall clamp [rad]
+    transition_speed: float        # wing-on airspeed [m/s]
+    transition_sharpness: float    # sigmoid steepness [1/(m/s)]
+    CL_delta_f: float              # lift increment per rad flap [1/rad]
+    max_flap: float                # max flap deflection [rad]
+    Cl_delta_a: float              # roll moment coeff per rad aileron [1/rad]
+    max_aileron: float             # max aileron deflection [rad]
+
+
+# ── pusher motor parameters ───────────────────────────────────────────────────
+
+class PusherParams(NamedTuple):
+    """Parameters for a forward-thrust pusher motor."""
+    kt: float                      # thrust coefficient [N·s²/rad²]
+    max_omega: float               # maximum motor speed [rad/s]
+
+
+# ── quadplane parameters ─────────────────────────────────────────────────────
+
+class QuadplaneParams(NamedTuple):
+    """Parameters for a quadplane (multirotor + fixed wing + pusher)."""
+    rotor: MultirotorParams        # multirotor subsystem
+    wing: WingParams               # fixed-wing subsystem
+    pusher: PusherParams           # forward-thrust pusher motor

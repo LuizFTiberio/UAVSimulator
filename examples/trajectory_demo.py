@@ -1,15 +1,14 @@
 """Trajectory tracking demo — square waypoint pattern."""
 
 import numpy as np
-import jax.numpy as jnp
 
 import matplotlib
 matplotlib.use("Agg")
 
-from uavsim.controllers.mpc import MPCController
 from uavsim.vehicles.multirotor import quadcopter
 from uavsim.sim.mujoco_sim import MuJoCoSimulator
 from uavsim.controllers.trajectory import TrajectoryController
+from uavsim.controllers.mpc import MPCController, default_mpc_config, racing_mpc_config
 from uavsim.viz.viewer import SimulationVisualizer
 from uavsim.viz.plotting import plot_flight_data
 
@@ -25,6 +24,31 @@ WAYPOINTS = [
 ]
 DURATION = 20.0
 
+# ── controller selection ─────────────────────────────────────────────────────
+# Choose one of:
+#   "pid"         — pure cascaded PID  (TrajectoryController)
+#   "mpc"         — MPC + PID, default tracking objective
+#   "mpc-racing"  — MPC + PID, racing objective (progress reward + speed tracking)
+CONTROLLER = "mpc"
+
+
+def _build_controller(vehicle, mode=CONTROLLER):
+    """Instantiate the chosen controller."""
+    if mode == "pid":
+        return TrajectoryController(vehicle.params)
+
+    elif mode == "mpc":
+        return MPCController(vehicle.params,
+                             config=default_mpc_config(vehicle.params))
+
+    elif mode == "mpc-racing":
+        return MPCController(vehicle.params,
+                             config=racing_mpc_config(vehicle.params))
+
+    else:
+        raise ValueError(f"Unknown controller mode: {mode!r}  "
+                         f"(choose 'pid', 'mpc', or 'mpc-racing')")
+
 
 def main():
     print("\n" + "=" * 65)
@@ -33,12 +57,12 @@ def main():
     print(f"  Waypoints : {len(WAYPOINTS)}")
     print(f"  Altitude  : {ALTITUDE} m")
     print(f"  Duration  : {DURATION} s")
+    print(f"  Controller: {CONTROLLER}")
     print("=" * 65 + "\n")
 
     vehicle = quadcopter()
     sim = MuJoCoSimulator(vehicle)
-    #ctrl = TrajectoryController(vehicle.params)
-    ctrl = MPCController(vehicle.params)
+    ctrl = _build_controller(vehicle)
     ctrl.set_waypoints(WAYPOINTS)
     vis = SimulationVisualizer(sim)
 

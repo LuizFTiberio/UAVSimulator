@@ -11,17 +11,21 @@ uavsim/
 │   └── math.py               # Quaternion & rotation utilities
 ├── dynamics/
 │   ├── propulsion.py         # Rotor thrust & torque (pure JAX, JIT-compatible)
-│   └── aerodynamics.py       # Body/wing aero (stub for future work)
+│   └── aerodynamics.py       # Wing lift/drag, flap & aileron aerodynamics
 ├── controllers/
 │   ├── pid.py                # Functional PID (init / step)
 │   ├── mixer.py              # X-quad motor allocation matrix
 │   ├── hover.py              # Cascaded position → attitude → motor controller
 │   ├── trajectory.py         # Waypoint-following controller
+│   ├── quadplane_ctrl.py     # Quadplane state-machine controller (7-channel)
 │   ├── mpc.py                # Two-level MPC (outer planner + inner hover)
 │   └── indi.py               # INDI controller (stub)
 ├── vehicles/
 │   ├── base.py               # VehicleModel dataclass
-│   └── multirotor.py         # Quadcopter params, model, and wrench function
+│   ├── multirotor.py         # Quadcopter params, model, and wrench function
+│   └── quadplane.py          # Quadplane (quad + wing + pusher) vehicle
+├── missions/
+│   └── transport.py          # Slung-load transport mission logic
 ├── sim/
 │   └── mujoco_sim.py         # Vehicle-agnostic MuJoCo stepping
 ├── envs/
@@ -31,7 +35,8 @@ uavsim/
 │   ├── viewer.py             # Real-time MuJoCo passive viewer
 │   └── plotting.py           # Post-flight Matplotlib plots
 └── models/
-    └── quadcopter.xml        # MJCF quadcopter model
+    ├── quadcopter.xml        # MJCF quadcopter model
+    └── quadplane.xml         # MJCF quadplane model (quad + wing + pusher)
 ```
 
 ## Quick Start
@@ -55,6 +60,8 @@ python examples/hover_demo.py
 | `examples/hover_demo.py` | Hover at 1 m, apply a velocity disturbance at t=2 s, watch recovery |
 | `examples/trajectory_demo.py` | Track a square waypoint pattern with MPC |
 | `examples/targets_demo.py` | Fly through a series of 3D square gates using MPC |
+| `examples/quadplane_demo.py` | Quadplane VTOL: takeoff, transition, cruise 70 m, decel, land |
+| `examples/transport_demo.py` | Slung-load transport: carry a payload from A to B with a quadcopter |
 
 Each example launches a real-time MuJoCo viewer and saves analysis plots on exit.
 
@@ -67,9 +74,11 @@ Each example launches a real-time MuJoCo viewer and saves analysis plots on exit
 
 ## Features
 
-- **JAX-accelerated dynamics** — JIT-compiled propulsion model; `jax.grad` through thrust computations
+- **JAX-accelerated dynamics** — JIT-compiled propulsion and aerodynamic models; `jax.grad` through thrust computations
 - **MuJoCo physics** — Rigid-body integration, contacts, and rendering
-- **Multiple controllers** — PID, Hover (cascaded), Trajectory, MPC, INDI (stub)
+- **Quadplane VTOL** — Full transition flight: hover → transition → cruise → decel → land, with state-machine controller, wing lift compensation, and coordinated aileron/rotor control
+- **Multiple controllers** — PID, Hover (cascaded), Trajectory, Quadplane (7-channel state machine), MPC, INDI (stub)
+- **Slung-load transport** — Cable-suspended payload delivery with pendulum dynamics
 - **Gymnasium environment** — `gymnasium.make("uavsim/Hover-v0")` for RL research
 - **Modular vehicle model** — Params + MJCF + wrench function bundled in a single `VehicleModel`
 - **Real-time 3D viewer** — MuJoCo passive rendering

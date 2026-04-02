@@ -31,3 +31,6 @@ Thumbs.db
 
 # MuJoCo
 *.log
+
+# Generated images
+*.png

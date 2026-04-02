@@ -91,3 +91,37 @@ def quadcopter(
         actuator_names=("act_fl", "act_fr", "act_bl", "act_br"),
         spin_signs=(1.0, -1.0, -1.0, 1.0),
     )
+
+
+# ── slung-load variant ───────────────────────────────────────────────────────
+
+def slung_quadcopter_params(
+    payload_mass: float = 0.15,
+    cable_mass: float = 0.02,
+    **kwargs,
+) -> MultirotorParams:
+    """Quadcopter params with mass adjusted for a slung-load payload.
+
+    The controller needs the *total* system mass for correct gravity
+    compensation.  MuJoCo's model carries the physical mass distribution;
+    this factory just ensures the feed-forward thrust matches the real weight.
+    """
+    base_mass = kwargs.pop("mass", 1.2)
+    total_mass = base_mass + payload_mass + cable_mass
+    return quadcopter_params(mass=total_mass, **kwargs)
+
+
+def slung_quadcopter(
+    payload_mass: float = 0.15,
+    cable_mass: float = 0.02,
+    **kwargs,
+) -> VehicleModel:
+    """Create a quadcopter vehicle tuned for slung-load transport.
+
+    The returned VehicleModel uses the standard quadcopter MJCF as a
+    fallback path; callers should pass the slung-load MJCF via
+    ``MuJoCoSimulator(vehicle, mjcf_override=xml)``.
+    """
+    params = slung_quadcopter_params(
+        payload_mass=payload_mass, cable_mass=cable_mass, **kwargs)
+    return quadcopter(params=params)

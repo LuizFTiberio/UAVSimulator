@@ -42,10 +42,13 @@ class MuJoCoSimulator:
 
         # Resolve visual actuator IDs (optional, for prop spin)
         self._act_ids: list[int] = []
-        for name in vehicle.actuator_names:
-            self._act_ids.append(
-                mujoco.mj_name2id(
-                    self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name))
+        self._act_cmds: list[int] = []  # index into command array
+        for i, name in enumerate(vehicle.actuator_names):
+            aid = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+            if aid >= 0:
+                self._act_ids.append(aid)
+                self._act_cmds.append(i)
         self._spin_signs = np.array(vehicle.spin_signs, dtype=float)
 
         # JIT-compile the wrench function for this vehicle's params
@@ -163,5 +166,5 @@ class MuJoCoSimulator:
 
     def _spin_props(self, throttle: np.ndarray) -> None:
         """Drive actuator signals so the props rotate visually."""
-        for i, aid in enumerate(self._act_ids):
-            self.data.ctrl[aid] = self._spin_signs[i] * throttle[i]
+        for aid, ci in zip(self._act_ids, self._act_cmds):
+            self.data.ctrl[aid] = self._spin_signs[ci] * throttle[ci]

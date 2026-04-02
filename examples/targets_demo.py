@@ -7,7 +7,9 @@ matplotlib.use("Agg")
 
 from uavsim.vehicles.multirotor import quadcopter
 from uavsim.sim.mujoco_sim import MuJoCoSimulator
-from uavsim.controllers.mpc import MPCController
+from uavsim.controllers.trajectory import TrajectoryController
+from uavsim.controllers.mpc import MPCController, default_mpc_config, racing_mpc_config
+from uavsim.core.types import HoverGains, PIDGains
 from uavsim.viz.viewer import SimulationVisualizer
 from uavsim.viz.plotting import plot_flight_data
 
@@ -26,6 +28,13 @@ GATES = [
 ]
 
 DURATION = 45.0
+
+# ── controller selection ─────────────────────────────────────────────────────
+# Choose one of:
+#   "pid"         — pure cascaded PID  (TrajectoryController)
+#   "mpc"         — MPC + PID, default tracking objective
+#   "mpc-racing"  — MPC + PID, racing objective (progress reward + speed tracking)
+CONTROLLER = "mpc-racing"
 
 # Gate colours (RGBA)
 COLOR_UPCOMING = "0.6 0.6 0.6 0.35"
@@ -146,6 +155,35 @@ def _check_gate_passage(position, gate, margin=0.3):
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
+def _build_controller(vehicle, mode=CONTROLLER):
+    """Instantiate the chosen controller."""
+    import jax.numpy as jnp
+
+    if mode == "pid":
+        gains = HoverGains(
+            kp_pos=3.5, ki_pos=0.1, kd_pos=3.0,
+            pos_integral_limit=jnp.array([1.0, 1.0, 0.5]),
+            att_gains=PIDGains(kp=8.0, ki=0.2, kd=3.0,
+                               max_output=1.5, integral_limit=0.3),
+            max_tilt=jnp.float32(jnp.deg2rad(35.0)),
+            min_alt=0.12, min_thrust_ratio=0.3,
+        )
+        return TrajectoryController(vehicle.params, gains=gains,
+                                    acceptance_radius=1.5)
+
+    elif mode == "mpc":
+        return MPCController(vehicle.params,
+                             config=default_mpc_config(vehicle.params),
+                             acceptance_radius=1.5)
+
+    elif mode == "mpc-racing":
+        return MPCController(vehicle.params,
+                             config=racing_mpc_config(vehicle.params),
+                             acceptance_radius=1.5)
+
+    else:
+        raise ValueError(f"Unknown controller mode: {mode!r}  "
+                         f"(choose 'pid', 'mpc', or 'mpc-racing')")
 
 def main():
     print("\n" + "=" * 65)
@@ -154,6 +192,7 @@ def main():
     print(f"  Gates      : {len(GATES)}")
     print(f"  Gate size  : {GATE_HALF_SIZE * 2:.0f} m × {GATE_HALF_SIZE * 2:.0f} m")
     print(f"  Duration   : {DURATION} s")
+    print(f"  Controller : {CONTROLLER}")
     print("=" * 65 + "\n")
 
     vehicle = quadcopter()
@@ -176,7 +215,7 @@ def main():
         waypoints.append((c + n * GATE_OFFSET).tolist())
     waypoints.append([0.0, 0.0, 1.0])      # descend
 
-    ctrl = MPCController(vehicle.params, acceptance_radius=1.5)
+    ctrl = _build_controller(vehicle)
     ctrl.set_waypoints(waypoints)
 
     vis = SimulationVisualizer(sim, cam_distance=14.0, cam_elevation=-30.0)
