@@ -38,7 +38,7 @@ uavsim/
 
 ```bash
 # Clone the repo
-git clone https://github.com/<your-username>/UAVSimulator.git
+git clone https://github.com/LuizFTiberio/UAVSimulator.git
 cd UAVSimulator
 
 # Install in editable mode (all optional deps)
