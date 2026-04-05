@@ -6,6 +6,7 @@ to the vehicle's ``compute_wrench`` function (pure JAX).
 
 from __future__ import annotations
 
+import logging
 from functools import partial
 
 import jax
@@ -14,7 +15,10 @@ import jax.numpy as jnp
 import mujoco
 
 from uavsim.core.types import VehicleState
+from uavsim.core.gpu import gpu_info
 from uavsim.vehicles.base import VehicleModel
+
+logger = logging.getLogger(__name__)
 
 
 class MuJoCoSimulator:
@@ -52,8 +56,14 @@ class MuJoCoSimulator:
         self._spin_signs = np.array(vehicle.spin_signs, dtype=float)
 
         # JIT-compile the wrench function for this vehicle's params
+        info = gpu_info()
+        device = jax.devices(info.jax_backend.value)[0] if info.has_gpu else jax.devices("cpu")[0]
+        self._jax_device = device
+        logger.info("MuJoCoSimulator using JAX device: %s", device)
+
         self._compute_wrench_jit = jax.jit(
-            partial(vehicle.compute_wrench, params=vehicle.params))
+            partial(vehicle.compute_wrench, params=vehicle.params),
+        )
 
         # History for post-flight analysis
         self.state_history: list[VehicleState] = []
