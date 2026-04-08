@@ -18,7 +18,7 @@ class VehicleModel:
     mjcf_path : Path
         Path to the MJCF XML model file.
     compute_wrench : callable
-        ``(state, motor_commands, params) -> (F_world, T_world)``
+        ``(state, motor_commands, params, wind_velocity) -> (F_world, T_world)``
         Pure JAX function computing net world-frame force and torque.
     actuator_names : tuple of str
         MuJoCo actuator names for visual prop spin (optional).

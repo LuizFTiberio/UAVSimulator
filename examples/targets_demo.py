@@ -10,6 +10,7 @@ from uavsim.sim.mujoco_sim import MuJoCoSimulator
 from uavsim.controllers.trajectory import TrajectoryController
 from uavsim.controllers.mpc import MPCController, default_mpc_config, racing_mpc_config
 from uavsim.core.types import HoverGains, PIDGains
+from uavsim.disturbances.wind import DrydenWind, DrydenParams
 from uavsim.viz.viewer import SimulationVisualizer
 from uavsim.viz.plotting import plot_flight_data
 
@@ -35,6 +36,15 @@ DURATION = 45.0
 #   "mpc"         — MPC + PID, default tracking objective
 #   "mpc-racing"  — MPC + PID, racing objective (progress reward + speed tracking)
 CONTROLLER = "mpc-racing"
+
+# ── wind settings ────────────────────────────────────────────────────────────
+ENABLE_WIND = True          # set to False for calm conditions
+MEAN_WIND   = [4.0, 2.0, 0.0]   # steady component [m/s]  (≈ 4.5 m/s from NE)
+DRYDEN_PARAMS = DrydenParams(    # gust / turbulence intensities
+    sigma_u=1.5, sigma_v=1.5, sigma_w=0.7,
+    Lu=200.0, Lv=200.0, Lw=50.0,
+)
+WIND_SEED = 42
 
 # Gate colours (RGBA)
 COLOR_UPCOMING = "0.6 0.6 0.6 0.35"
@@ -193,6 +203,7 @@ def main():
     print(f"  Gate size  : {GATE_HALF_SIZE * 2:.0f} m × {GATE_HALF_SIZE * 2:.0f} m")
     print(f"  Duration   : {DURATION} s")
     print(f"  Controller : {CONTROLLER}")
+    print(f"  Wind       : {'Dryden  mean=' + str(MEAN_WIND) if ENABLE_WIND else 'OFF'}")
     print("=" * 65 + "\n")
 
     vehicle = quadcopter()
@@ -201,7 +212,11 @@ def main():
     mjcf_xml = _inject_gates_into_xml(
         vehicle.mjcf_path, GATES, GATE_HALF_SIZE, BEAM_RADIUS,
     )
-    sim = MuJoCoSimulator(vehicle, mjcf_override=mjcf_xml)
+    wind_model = (
+        DrydenWind(params=DRYDEN_PARAMS, mean_wind=MEAN_WIND, seed=WIND_SEED)
+        if ENABLE_WIND else None
+    )
+    sim = MuJoCoSimulator(vehicle, mjcf_override=mjcf_xml, wind_model=wind_model)
 
     # Waypoints: take-off → through each gate → descend.
     # Place each gate waypoint 2 m past the gate plane (along the normal)

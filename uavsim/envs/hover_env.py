@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from uavsim.sensors.models import SensorConfig
 from uavsim.vehicles.base import VehicleModel
 from uavsim.vehicles.multirotor import quadcopter
 from uavsim.envs.base_env import BaseUAVEnv
@@ -22,10 +23,17 @@ class HoverEnv(BaseUAVEnv):
         setpoint: np.ndarray | None = None,
         max_episode_steps: int = 5000,
         render_mode: str | None = None,
+        sensor_config: SensorConfig | None = None,
+        sensor_seed: int = 0,
+        wind_model=None,
     ):
         if vehicle is None:
             vehicle = quadcopter()
-        super().__init__(vehicle, max_episode_steps, render_mode)
+        super().__init__(
+            vehicle, max_episode_steps, render_mode,
+            sensor_config=sensor_config, sensor_seed=sensor_seed,
+            wind_model=wind_model,
+        )
         self.setpoint = (
             np.array([0.0, 0.0, 1.0]) if setpoint is None
             else np.asarray(setpoint, dtype=np.float32)

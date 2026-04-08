@@ -31,10 +31,19 @@ class MuJoCoSimulator:
     ----------
     vehicle : VehicleModel
         Vehicle definition (params, MJCF path, dynamics).
+    wind_model : WindModel | None
+        Optional wind model.  If provided, wind velocity is queried each
+        step and passed to the vehicle's ``compute_wrench`` function.
     """
 
-    def __init__(self, vehicle: VehicleModel, mjcf_override: str | None = None):
+    def __init__(
+        self,
+        vehicle: VehicleModel,
+        mjcf_override: str | None = None,
+        wind_model=None,
+    ):
         self.vehicle = vehicle
+        self.wind_model = wind_model
         if mjcf_override is not None:
             self.model = mujoco.MjModel.from_xml_string(mjcf_override)
         else:
@@ -114,8 +123,17 @@ class MuJoCoSimulator:
         cmds = jnp.asarray(motor_commands, dtype=jnp.float32)
         state = self.get_state()
 
+        # Query wind model (if any)
+        if self.wind_model is not None:
+            altitude = float(state.position[2])
+            v_wind = self.wind_model.step(altitude, self.dt)
+            wind_jax = jnp.asarray(v_wind, dtype=jnp.float32)
+        else:
+            wind_jax = jnp.zeros(3)
+
         # Compute forces via JIT-compiled vehicle dynamics
-        F_world, T_world = self._compute_wrench_jit(state, cmds)
+        F_world, T_world = self._compute_wrench_jit(
+            state, cmds, wind_velocity=wind_jax)
 
         # Inject into MuJoCo
         bid = self._body_id
@@ -138,6 +156,13 @@ class MuJoCoSimulator:
         """Add a velocity impulse (world frame, m/s) to the body."""
         self.data.qvel[0:3] += np.asarray(impulse, dtype=float)
         mujoco.mj_forward(self.model, self.data)
+
+    @property
+    def wind_velocity(self) -> np.ndarray:
+        """Current wind velocity (world frame, m/s).  Zeros if no wind model."""
+        if self.wind_model is not None:
+            return np.asarray(self.wind_model.current_velocity)
+        return np.zeros(3)
 
     # ── reset ────────────────────────────────────────────────────────────
 
@@ -168,6 +193,9 @@ class MuJoCoSimulator:
 
         self.state_history.clear()
         self.time_history.clear()
+
+        if self.wind_model is not None:
+            self.wind_model.reset()
 
         mujoco.mj_forward(self.model, self.data)
         return self.get_state()

@@ -107,3 +107,32 @@ class QuadplaneParams(NamedTuple):
     rotor: MultirotorParams        # multirotor subsystem
     wing: WingParams               # fixed-wing subsystem
     pusher: PusherParams           # forward-thrust pusher motor
+
+
+# ── body drag parameters ─────────────────────────────────────────────────────
+
+class BodyDragParams(NamedTuple):
+    """Bluff-body aerodynamic drag parameters.
+
+    Used by multirotors (and any vehicle) to model translational drag
+    as a function of airspeed: F_drag = -½ ρ Cd A |v_air| v_air.
+    """
+    rho: float = 1.225             # air density [kg/m³]
+    Cd: float = 1.0                # drag coefficient (approx. flat plate for quad frame)
+    frontal_area: float = 0.04     # effective frontal area [m²]
+
+
+# ── Dryden wind parameters ───────────────────────────────────────────────────
+
+class DrydenParams(NamedTuple):
+    """MIL-HDBK-1797 Dryden turbulence model parameters.
+
+    Scale lengths and intensities are for a fixed altitude band.
+    For altitude-varying profiles, update these per step.
+    """
+    sigma_u: float = 1.06         # longitudinal turbulence intensity [m/s]
+    sigma_v: float = 1.06         # lateral turbulence intensity [m/s]
+    sigma_w: float = 0.7          # vertical turbulence intensity [m/s]
+    Lu: float = 200.0             # longitudinal scale length [m]
+    Lv: float = 200.0             # lateral scale length [m]
+    Lw: float = 50.0              # vertical scale length [m]

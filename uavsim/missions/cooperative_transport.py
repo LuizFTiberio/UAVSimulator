@@ -201,7 +201,13 @@ class MultiVehicleSimAdapter:
         cmds = np.asarray(motor_commands)
         for i in range(self.n):
             state_i = self.get_state(i)
-            F, T = self.sim._compute_wrench_jit(state_i, jnp.asarray(cmds[i]))
+            wind_jax = jnp.zeros(3)
+            if self.sim.wind_model is not None:
+                alt = float(state_i.position[2])
+                v_wind = self.sim.wind_model.step(alt, self.sim.dt)
+                wind_jax = jnp.asarray(v_wind, dtype=jnp.float32)
+            F, T = self.sim._compute_wrench_jit(
+                state_i, jnp.asarray(cmds[i]), wind_velocity=wind_jax)
             bid = self._body_ids[i]
             self.sim.data.xfrc_applied[bid, 0:3] = np.asarray(F)
             self.sim.data.xfrc_applied[bid, 3:6] = np.asarray(T)

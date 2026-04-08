@@ -12,6 +12,8 @@ uavsim/
 ├── dynamics/
 │   ├── propulsion.py         # Rotor thrust & torque (pure JAX, JIT-compatible)
 │   └── aerodynamics.py       # Wing lift/drag, flap & aileron aerodynamics
+├── disturbances/
+│   └── wind.py               # Dryden turbulence (MIL-HDBK-1797), constant wind
 ├── controllers/
 │   ├── pid.py                # Functional PID (init / step)
 │   ├── mixer.py              # X-quad motor allocation matrix
@@ -62,6 +64,7 @@ python examples/hover_demo.py
 | `examples/targets_demo.py` | Fly through a series of 3D square gates using MPC |
 | `examples/quadplane_demo.py` | Quadplane VTOL: takeoff, transition, cruise 70 m, decel, land |
 | `examples/transport_demo.py` | Slung-load transport: carry a payload from A to B with a quadcopter |
+| `examples/wind_demo.py` | Wind disturbance: 3 quads hover under no-wind, steady crosswind, and Dryden turbulence |
 
 Each example launches a real-time MuJoCo viewer and saves analysis plots on exit.
 
@@ -79,6 +82,7 @@ Each example launches a real-time MuJoCo viewer and saves analysis plots on exit
 - **Quadplane VTOL** — Full transition flight: hover → transition → cruise → decel → land, with state-machine controller, wing lift compensation, and coordinated aileron/rotor control
 - **Multiple controllers** — PID, Hover (cascaded), Trajectory, Quadplane (7-channel state machine), MPC, INDI (stub)
 - **Slung-load transport** — Cable-suspended payload delivery with pendulum dynamics
+- **Wind & turbulence** — Dryden (MIL-HDBK-1797) turbulence model with body drag; wind velocity flows into vehicle dynamics for correct airspeed computation
 - **Gymnasium environment** — `gymnasium.make("uavsim/Hover-v0")` for RL research
 - **Modular vehicle model** — Params + MJCF + wrench function bundled in a single `VehicleModel`
 - **Real-time 3D viewer** — MuJoCo passive rendering

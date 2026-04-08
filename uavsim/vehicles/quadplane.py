@@ -23,6 +23,7 @@ def quadplane_wrench(
     state: VehicleState,
     motor_commands: jnp.ndarray,
     params: QuadplaneParams,
+    wind_velocity: jnp.ndarray = jnp.zeros(3),
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Compute world-frame force and torque for a quadplane.
 
@@ -37,6 +38,7 @@ def quadplane_wrench(
         index    5 : flap [0, 1]  (0 = retracted, 1 = full)
         index    6 : aileron [-1, 1]  (positive = roll right)
     params : QuadplaneParams
+    wind_velocity : (3,) world-frame wind velocity [m/s]
 
     Returns
     -------
@@ -64,7 +66,8 @@ def quadplane_wrench(
     flap_cmd = motor_commands[5]     # [0, 1]
     aileron_cmd = motor_commands[6]  # [-1, 1]
     F_wing, T_wing = compute_wing_wrench(
-        state, params.wing, flap=flap_cmd, aileron=aileron_cmd)
+        state, params.wing, flap=flap_cmd, aileron=aileron_cmd,
+        wind_velocity=wind_velocity)
 
     return F_rotor + F_pusher + F_wing, T_rotor + T_wing
 

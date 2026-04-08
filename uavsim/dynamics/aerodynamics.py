@@ -11,6 +11,7 @@ def compute_wing_wrench(
     wing: WingParams,
     flap: float = 0.0,
     aileron: float = 0.0,
+    wind_velocity: jnp.ndarray = jnp.zeros(3),
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Compute world-frame aerodynamic force from a fixed wing.
 
@@ -29,6 +30,7 @@ def compute_wing_wrench(
         Normalised flap command [0, 1].  0 = retracted, 1 = full.
     aileron : float
         Normalised aileron command [-1, 1].  Positive = roll right.
+    wind_velocity : (3,) world-frame wind velocity [m/s]
 
     Returns
     -------
@@ -36,15 +38,16 @@ def compute_wing_wrench(
     T_world : (3,) aerodynamic torque in world frame [N·m]
     """
     R = quat_to_rotation_matrix(state.quaternion)
-    # Body-frame velocity
-    v_body = R.T @ state.velocity                       # (3,)
+    # Body-frame airspeed (relative to the air mass)
+    v_air_world = state.velocity - wind_velocity
+    v_body = R.T @ v_air_world                              # (3,)
 
     u = v_body[0]   # forward
     w = v_body[2]   # downward (body z)
 
     # Airspeed in the longitudinal plane
     V_lon = jnp.sqrt(u ** 2 + w ** 2)
-    V_total = jnp.linalg.norm(state.velocity)
+    V_total = jnp.linalg.norm(v_air_world)
 
     # Angle of attack (clamped for linear regime)
     alpha_raw = jnp.arctan2(w, u)
