@@ -6,6 +6,7 @@ to the vehicle's ``compute_wrench`` function (pure JAX).
 
 from __future__ import annotations
 
+import logging
 from functools import partial
 
 import jax
@@ -14,7 +15,10 @@ import jax.numpy as jnp
 import mujoco
 
 from uavsim.core.types import VehicleState
+from uavsim.core.gpu import gpu_info
 from uavsim.vehicles.base import VehicleModel
+
+logger = logging.getLogger(__name__)
 
 
 class MuJoCoSimulator:
@@ -27,10 +31,19 @@ class MuJoCoSimulator:
     ----------
     vehicle : VehicleModel
         Vehicle definition (params, MJCF path, dynamics).
+    wind_model : WindModel | None
+        Optional wind model.  If provided, wind velocity is queried each
+        step and passed to the vehicle's ``compute_wrench`` function.
     """
 
-    def __init__(self, vehicle: VehicleModel, mjcf_override: str | None = None):
+    def __init__(
+        self,
+        vehicle: VehicleModel,
+        mjcf_override: str | None = None,
+        wind_model=None,
+    ):
         self.vehicle = vehicle
+        self.wind_model = wind_model
         if mjcf_override is not None:
             self.model = mujoco.MjModel.from_xml_string(mjcf_override)
         else:
@@ -42,15 +55,24 @@ class MuJoCoSimulator:
 
         # Resolve visual actuator IDs (optional, for prop spin)
         self._act_ids: list[int] = []
-        for name in vehicle.actuator_names:
-            self._act_ids.append(
-                mujoco.mj_name2id(
-                    self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name))
+        self._act_cmds: list[int] = []  # index into command array
+        for i, name in enumerate(vehicle.actuator_names):
+            aid = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+            if aid >= 0:
+                self._act_ids.append(aid)
+                self._act_cmds.append(i)
         self._spin_signs = np.array(vehicle.spin_signs, dtype=float)
 
         # JIT-compile the wrench function for this vehicle's params
+        info = gpu_info()
+        device = jax.devices(info.jax_backend.value)[0] if info.has_gpu else jax.devices("cpu")[0]
+        self._jax_device = device
+        logger.info("MuJoCoSimulator using JAX device: %s", device)
+
         self._compute_wrench_jit = jax.jit(
-            partial(vehicle.compute_wrench, params=vehicle.params))
+            partial(vehicle.compute_wrench, params=vehicle.params),
+        )
 
         # History for post-flight analysis
         self.state_history: list[VehicleState] = []
@@ -101,8 +123,17 @@ class MuJoCoSimulator:
         cmds = jnp.asarray(motor_commands, dtype=jnp.float32)
         state = self.get_state()
 
+        # Query wind model (if any)
+        if self.wind_model is not None:
+            altitude = float(state.position[2])
+            v_wind = self.wind_model.step(altitude, self.dt)
+            wind_jax = jnp.asarray(v_wind, dtype=jnp.float32)
+        else:
+            wind_jax = jnp.zeros(3)
+
         # Compute forces via JIT-compiled vehicle dynamics
-        F_world, T_world = self._compute_wrench_jit(state, cmds)
+        F_world, T_world = self._compute_wrench_jit(
+            state, cmds, wind_velocity=wind_jax)
 
         # Inject into MuJoCo
         bid = self._body_id
@@ -125,6 +156,13 @@ class MuJoCoSimulator:
         """Add a velocity impulse (world frame, m/s) to the body."""
         self.data.qvel[0:3] += np.asarray(impulse, dtype=float)
         mujoco.mj_forward(self.model, self.data)
+
+    @property
+    def wind_velocity(self) -> np.ndarray:
+        """Current wind velocity (world frame, m/s).  Zeros if no wind model."""
+        if self.wind_model is not None:
+            return np.asarray(self.wind_model.current_velocity)
+        return np.zeros(3)
 
     # ── reset ────────────────────────────────────────────────────────────
 
@@ -156,6 +194,9 @@ class MuJoCoSimulator:
         self.state_history.clear()
         self.time_history.clear()
 
+        if self.wind_model is not None:
+            self.wind_model.reset()
+
         mujoco.mj_forward(self.model, self.data)
         return self.get_state()
 
@@ -163,5 +204,5 @@ class MuJoCoSimulator:
 
     def _spin_props(self, throttle: np.ndarray) -> None:
         """Drive actuator signals so the props rotate visually."""
-        for i, aid in enumerate(self._act_ids):
-            self.data.ctrl[aid] = self._spin_signs[i] * throttle[i]
+        for aid, ci in zip(self._act_ids, self._act_cmds):
+            self.data.ctrl[aid] = self._spin_signs[ci] * throttle[ci]

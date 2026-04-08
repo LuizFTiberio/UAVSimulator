@@ -1,0 +1,136 @@
+<?xml version="1.0" ?>
+<!--
+  Quadplane model for MuJoCo >= 3.0
+
+  Wing-dominant design: 1.2 m wingspan, AR 8, with compact quad rotors
+  and a rear pusher motor for forward flight.
+
+  Motor layout (X configuration, viewed from above):
+      FL (-x, +y)    FR (+x, +y)
+      BL (-x, -y)    BR (+x, -y)
+  Pusher: rear, thrust along +X (body forward)
+
+  Thrust & aero forces are applied via xfrc_applied in Python.
+  Rotor + pusher joints are cosmetic (visual prop spin only).
+-->
+<mujoco model="quadplane">
+
+  <compiler inertiafromgeom="auto" angle="radian"/>
+
+  <option timestep="0.001" gravity="0 0 -9.81" integrator="RK4"/>
+
+  <visual>
+    <headlight ambient="0.4 0.4 0.4" diffuse="0.6 0.6 0.6" specular="0.1 0.1 0.1"/>
+    <map shadowclip="1" shadowscale="0.6"/>
+    <quality shadowsize="2048"/>
+    <global offwidth="1280" offheight="720"/>
+  </visual>
+
+  <asset>
+    <texture name="skybox" type="skybox" builtin="gradient"
+             rgb1="0.4 0.6 0.8" rgb2="0.8 0.9 1.0" width="512" height="512"/>
+    <texture name="tex_ground" type="2d" builtin="checker"
+             rgb1="0.45 0.45 0.45" rgb2="0.55 0.55 0.55" width="512" height="512"/>
+    <material name="mat_ground" texture="tex_ground" texrepeat="10 10"
+              specular="0.1" shininess="0.1" reflectance="0.0"/>
+    <material name="mat_body"   rgba="0.15 0.20 0.80 1" specular="0.5" shininess="0.7"/>
+    <material name="mat_arm"    rgba="0.20 0.20 0.20 1" specular="0.2"/>
+    <material name="mat_motor"  rgba="0.10 0.10 0.10 1" specular="0.3"/>
+    <material name="mat_rotor"  rgba="0.85 0.15 0.15 0.75" specular="0.2"/>
+    <material name="mat_wing"   rgba="0.90 0.90 0.90 0.9" specular="0.3" shininess="0.5"/>
+    <material name="mat_tail"   rgba="0.70 0.70 0.70 0.9" specular="0.2"/>
+    <material name="mat_pusher" rgba="0.2 0.6 0.2 0.8" specular="0.2"/>
+  </asset>
+
+  <worldbody>
+    <!-- Ground plane — 120 m radius -->
+    <geom name="ground" type="plane" size="120 120 0.1" material="mat_ground" pos="0 0 0"/>
+
+    <!-- Main quadplane body -->
+    <body name="body" pos="0 0 0.5">
+      <freejoint name="root"/>
+
+      <!-- Central fuselage (compact) -->
+      <inertial pos="0 0 0" mass="1.2" diaginertia="0.020 0.005 0.022"/>
+      <geom name="body_geom" type="box" size="0.12 0.04 0.03" material="mat_body"/>
+
+      <!-- Arms (smaller, X-config, arm_length=0.12) -->
+      <geom name="arm_fl_br" type="box" size="0.12 0.012 0.006" euler="0 0  0.7854" material="mat_arm"/>
+      <geom name="arm_fr_bl" type="box" size="0.12 0.012 0.006" euler="0 0 -0.7854" material="mat_arm"/>
+
+      <!-- ========== Wing (1.2 m span, chord = 1.2/8 = 0.15 m) ========== -->
+      <!-- half-chord = 0.075,  half-span = 0.6 -->
+      <geom name="wing" type="box" size="0.075 0.6 0.008"
+            pos="0 0 0.015" material="mat_wing"/>
+
+      <!-- Flaperon surfaces (visual) — one per wing side.
+           Same surface acts as flap (both down) or aileron (differential). -->
+      <geom name="flaperon_left"  type="box" size="0.025 0.28 0.004"
+            pos="-0.055 0.31 0.015" rgba="0.9 0.3 0.3 0.8"/>
+      <geom name="flaperon_right" type="box" size="0.025 0.28 0.004"
+            pos="-0.055 -0.31 0.015" rgba="0.9 0.3 0.3 0.8"/>
+
+      <!-- Tail boom (visual) -->
+      <geom name="tail_boom" type="capsule" fromto="0 0 0  -0.25 0 0"
+            size="0.008" material="mat_arm"/>
+
+      <!-- Vertical tail fin (visual stability cue) -->
+      <geom name="vtail" type="box" size="0.04 0.003 0.035"
+            pos="-0.27 0 0.035" material="mat_tail"/>
+
+      <!-- ---- Front-Left motor + rotor (smaller props, r=0.08) ---- -->
+      <body name="motor_fl" pos="-0.12 0.12 0.0">
+        <inertial pos="0 0 0" mass="0.04" diaginertia="5e-5 5e-5 5e-5"/>
+        <geom name="motor_fl_geom" type="cylinder" size="0.012 0.015" material="mat_motor"/>
+        <joint name="rotor_fl" type="hinge" axis="0 0 1" limited="false" damping="1e-4"/>
+        <geom name="prop_fl" type="cylinder" size="0.08 0.002" pos="0 0 0.017" material="mat_rotor"/>
+      </body>
+
+      <!-- ---- Front-Right motor + rotor ---- -->
+      <body name="motor_fr" pos="0.12 0.12 0.0">
+        <inertial pos="0 0 0" mass="0.04" diaginertia="5e-5 5e-5 5e-5"/>
+        <geom name="motor_fr_geom" type="cylinder" size="0.012 0.015" material="mat_motor"/>
+        <joint name="rotor_fr" type="hinge" axis="0 0 1" limited="false" damping="1e-4"/>
+        <geom name="prop_fr" type="cylinder" size="0.08 0.002" pos="0 0 0.017" material="mat_rotor"/>
+      </body>
+
+      <!-- ---- Back-Left motor + rotor ---- -->
+      <body name="motor_bl" pos="-0.12 -0.12 0.0">
+        <inertial pos="0 0 0" mass="0.04" diaginertia="5e-5 5e-5 5e-5"/>
+        <geom name="motor_bl_geom" type="cylinder" size="0.012 0.015" material="mat_motor"/>
+        <joint name="rotor_bl" type="hinge" axis="0 0 1" limited="false" damping="1e-4"/>
+        <geom name="prop_bl" type="cylinder" size="0.08 0.002" pos="0 0 0.017" material="mat_rotor"/>
+      </body>
+
+      <!-- ---- Back-Right motor + rotor ---- -->
+      <body name="motor_br" pos="0.12 -0.12 0.0">
+        <inertial pos="0 0 0" mass="0.04" diaginertia="5e-5 5e-5 5e-5"/>
+        <geom name="motor_br_geom" type="cylinder" size="0.012 0.015" material="mat_motor"/>
+        <joint name="rotor_br" type="hinge" axis="0 0 1" limited="false" damping="1e-4"/>
+        <geom name="prop_br" type="cylinder" size="0.08 0.002" pos="0 0 0.017" material="mat_rotor"/>
+      </body>
+
+      <!-- ---- Pusher motor (rear, thrust along +X) ---- -->
+      <!-- Motor housing: static geom, oriented along X via fromto -->
+      <geom name="motor_pusher_geom" type="cylinder" size="0.012"
+            fromto="-0.235 0 0  -0.265 0 0" material="mat_motor"/>
+      <!-- Prop body: oriented so local Z = parent X (pusher spin axis).
+           Joint axis 0 0 1 spins the disc in the body's XY plane = parent YZ. -->
+      <body name="pusher_prop_body" pos="-0.267 0.0 0.0" euler="0 1.5708 0">
+        <inertial pos="0 0 0" mass="0.02" diaginertia="2e-5 2e-5 2e-5"/>
+        <joint name="rotor_pusher" type="hinge" axis="0 0 1" limited="false" damping="1e-4"/>
+        <geom name="prop_pusher" type="cylinder" size="0.06 0.002"
+              material="mat_pusher"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <motor name="act_fl" joint="rotor_fl" gear="0.01" ctrlrange="-1 1"/>
+    <motor name="act_fr" joint="rotor_fr" gear="0.01" ctrlrange="-1 1"/>
+    <motor name="act_bl" joint="rotor_bl" gear="0.01" ctrlrange="-1 1"/>
+    <motor name="act_br" joint="rotor_br" gear="0.01" ctrlrange="-1 1"/>
+    <motor name="act_pusher" joint="rotor_pusher" gear="0.01" ctrlrange="-1 1"/>
+  </actuator>
+
+</mujoco>

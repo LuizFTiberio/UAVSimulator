@@ -15,9 +15,9 @@
 -->
 <mujoco model="quadcopter">
 
-  <!-- angle="radian" is default in MJ3; coordinate="local" is removed — omit it -->
   <!-- inertiafromgeom="auto": use explicit <inertial> when present, geom-derived otherwise -->
-  <compiler inertiafromgeom="auto"/>
+  <!-- angle="radian": all euler/angle values in this file are in radians -->
+  <compiler inertiafromgeom="auto" angle="radian"/>
 
   <option timestep="0.001" gravity="0 0 -9.81" integrator="RK4"/>
 

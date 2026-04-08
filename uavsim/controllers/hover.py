@@ -52,6 +52,9 @@ def hover_step(
     gains: HoverGains,
     dt: float,
     desired_yaw: float = 0.0,
+    xy_weight: float = 1.0,
+    desired_roll_override: float | None = None,
+    external_lift_N: float = 0.0,
 ) -> tuple[HoverState, jnp.ndarray]:
     """Advance the hover controller by one timestep.
 
@@ -64,6 +67,19 @@ def hover_step(
     gains : HoverGains
     dt : timestep [s]
     desired_yaw : heading setpoint [rad]
+    xy_weight : float
+        Scale factor [0, 1] for XY position tracking.  1.0 = full
+        position hold (hover).  0.0 = altitude-only (cruise — no
+        pitch/roll from XY error or velocity damping).
+    desired_roll_override : float | None
+        When not None, overrides the roll target computed from XY
+        position error.  Used by the quadplane cruise controller so
+        that the quad rotors cooperate with the ailerons instead of
+        fighting them.
+    external_lift_N : float
+        Estimated external upward force (e.g. wing lift) [N].  Subtracted
+        from the rotor thrust command so the PID altitude loop doesn't
+        over-thrust when the wing is producing lift.
 
     Returns
     -------
@@ -81,9 +97,12 @@ def hover_step(
     # ── position PID (outer loop) ────────────────────────────────────────
     pos_err = safe_setpoint - position
 
+    # Mask: suppress XY when xy_weight < 1 (cruise flight mode).
+    xy_mask = jnp.array([xy_weight, xy_weight, 1.0])
+
     # Freeze integrator near the ground to prevent windup
     on_ground = position[2] < gains.min_alt + 0.05
-    raw_integral = state.pos_integral + pos_err * dt
+    raw_integral = state.pos_integral + pos_err * dt * xy_mask
     raw_integral = jnp.clip(raw_integral,
                             -gains.pos_integral_limit, gains.pos_integral_limit)
     pos_integral = jnp.where(on_ground, state.pos_integral, raw_integral)
@@ -91,10 +110,14 @@ def hover_step(
     accel_cmd = (gains.kp_pos * pos_err
                  + gains.ki_pos * pos_integral
                  + gains.kd_pos * (-velocity))
+    accel_cmd = accel_cmd * xy_mask
 
     # ── desired attitude from commanded XY acceleration ──────────────────
     desired_roll = jnp.clip(-accel_cmd[1] / params.gravity,
                             -gains.max_tilt, gains.max_tilt)
+    if desired_roll_override is not None:
+        desired_roll = jnp.clip(jnp.asarray(desired_roll_override),
+                                -gains.max_tilt, gains.max_tilt)
     desired_pitch = jnp.clip(accel_cmd[0] / params.gravity,
                              -gains.max_tilt, gains.max_tilt)
     desired_att = jnp.array([desired_roll, desired_pitch, desired_yaw])
@@ -106,7 +129,8 @@ def hover_step(
     hover_thrust = params.mass * params.gravity
     max_thrust = 4.0 * params.kt * params.max_omega ** 2
     min_thrust = gains.min_thrust_ratio * hover_thrust
-    thrust_n = jnp.clip(params.mass * alt_accel / cos_t, min_thrust, max_thrust)
+    rotor_thrust_needed = params.mass * alt_accel / cos_t - external_lift_N
+    thrust_n = jnp.clip(rotor_thrust_needed, min_thrust, max_thrust)
 
     # ── attitude PID (inner loop) ────────────────────────────────────────
     att_error = desired_att - attitude

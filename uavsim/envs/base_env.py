@@ -7,6 +7,7 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from uavsim.sim.mujoco_sim import MuJoCoSimulator
+from uavsim.sensors.models import SensorConfig, SensorSuite
 from uavsim.vehicles.base import VehicleModel
 
 
@@ -17,6 +18,14 @@ class BaseUAVEnv(gym.Env):
 
     Observation (default): [position(3), velocity(3), quaternion(4), angular_velocity(3)] = 13.
     Action: motor commands [0, 1]^n_motors.
+
+    Parameters
+    ----------
+    sensor_config : SensorConfig | None
+        Sensor noise configuration. Pass ``None`` for clean (no-noise)
+        observations.  Default is ``None`` (backwards compatible).
+    sensor_seed : int
+        RNG seed for sensor noise (for reproducibility / domain randomization).
     """
 
     metadata = {"render_modes": ["human"]}
@@ -26,13 +35,21 @@ class BaseUAVEnv(gym.Env):
         vehicle: VehicleModel,
         max_episode_steps: int = 5000,
         render_mode: str | None = None,
+        sensor_config: SensorConfig | None = None,
+        sensor_seed: int = 0,
+        wind_model=None,
     ):
         super().__init__()
         self.vehicle = vehicle
-        self.sim = MuJoCoSimulator(vehicle)
+        self.sim = MuJoCoSimulator(vehicle, wind_model=wind_model)
         self.max_episode_steps = max_episode_steps
         self.render_mode = render_mode
         self._step_count = 0
+
+        # Sensor dynamics (None → clean observations)
+        self.sensors: SensorSuite | None = None
+        if sensor_config is not None:
+            self.sensors = SensorSuite(sensor_config, seed=sensor_seed)
 
         n_motors = vehicle.params.motor_positions.shape[0]
 
@@ -45,6 +62,11 @@ class BaseUAVEnv(gym.Env):
 
     def _get_obs(self) -> np.ndarray:
         state = self.sim.get_state()
+
+        if self.sensors is not None:
+            measurements = self.sensors.observe(state, dt=self.sim.dt)
+            return self.sensors.to_flat_obs(measurements, state)
+
         return np.concatenate([
             np.asarray(state.position),
             np.asarray(state.velocity),
@@ -64,6 +86,8 @@ class BaseUAVEnv(gym.Env):
         super().reset(seed=seed)
         self.sim.reset()
         self._step_count = 0
+        if self.sensors is not None:
+            self.sensors.reset()
         return self._get_obs(), self._get_info()
 
     def step(self, action):

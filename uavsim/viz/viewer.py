@@ -1,5 +1,6 @@
 """MuJoCo passive viewer with drone tracking."""
 
+import logging
 import time as _time
 
 import mujoco
@@ -7,6 +8,8 @@ import mujoco.viewer
 import numpy as np
 
 from uavsim.sim.mujoco_sim import MuJoCoSimulator
+
+logger = logging.getLogger(__name__)
 
 
 class SimulationVisualizer:
@@ -29,13 +32,18 @@ class SimulationVisualizer:
         cam_elevation: float = -25.0,
         cam_azimuth: float = 135.0,
         track: bool = True,
+        render_fps: float = 60.0,
     ):
         self.sim = sim
         self.cam_distance = cam_distance
         self.cam_elevation = cam_elevation
         self.cam_azimuth = cam_azimuth
         self.track = track
+        self.render_fps = render_fps
         self.viewer = None
+        self._last_render_time: float = 0.0
+        self._wall_start: float = 0.0
+        self._sim_start: float = 0.0
 
     # ── public API ───────────────────────────────────────────────────────
 
@@ -53,6 +61,10 @@ class SimulationVisualizer:
             self.sim.model, self.sim.data)
         self._configure_scene()
         self._set_initial_camera()
+        self._log_renderer_info()
+        self._wall_start = _time.monotonic()
+        self._sim_start = self.sim.current_time
+        self._last_render_time = 0.0
         return self
 
     def draw_gates(self, gates: list[dict]) -> None:
@@ -93,14 +105,38 @@ class SimulationVisualizer:
                     scn.ngeom += 1
 
     def sync(self, real_time_factor: float = 1.0) -> None:
-        """Render one frame, optionally tracking the drone."""
+        """Render one frame if enough time has passed, with wall-clock sync.
+
+        Only renders at ``render_fps`` (default 60 Hz).  Between renders
+        the call returns immediately, so physics can run at full speed.
+
+        Parameters
+        ----------
+        real_time_factor : float
+            1.0 = real-time, 2.0 = 2× speed, 0 = no throttling (fast-forward).
+        """
         if self.viewer is None:
             return
+
+        # Check if it's time to render a new frame
+        sim_elapsed = self.sim.current_time - self._sim_start
+        render_interval = 1.0 / self.render_fps
+        if sim_elapsed - self._last_render_time < render_interval:
+            return  # skip — not time yet
+
+        self._last_render_time = sim_elapsed
+
         if self.track:
             self._follow_drone()
         self.viewer.sync()
+
+        # Wall-clock sync: sleep only if physics is ahead of desired pace
         if real_time_factor > 0.0:
-            _time.sleep(self.sim.dt * real_time_factor)
+            wall_elapsed = _time.monotonic() - self._wall_start
+            desired_wall = sim_elapsed / real_time_factor
+            ahead = desired_wall - wall_elapsed
+            if ahead > 0.001:
+                _time.sleep(ahead)
 
     def close(self) -> None:
         if self.viewer is not None:
@@ -137,3 +173,18 @@ class SimulationVisualizer:
             self.viewer.cam.lookat[:] = (
                 (1.0 - alpha) * self.viewer.cam.lookat + alpha * pos
             )
+
+    def _log_renderer_info(self) -> None:
+        """Log the OpenGL renderer being used by MuJoCo."""
+        try:
+            ctx = self.sim.model.vis.global_
+            gl_renderer = mujoco.mj_getPluginConfig(self.sim.model, -1, "renderer") if hasattr(mujoco, 'mj_getPluginConfig') else ""
+        except Exception:
+            gl_renderer = ""
+        from uavsim.core.gpu import gpu_info
+        info = gpu_info()
+        logger.info(
+            "Viewer launched — rendering on %s (%s)",
+            info.device_name or "default GPU",
+            info.vendor.value,
+        )

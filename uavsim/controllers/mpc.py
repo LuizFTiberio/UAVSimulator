@@ -45,10 +45,13 @@ class MPCConfig(NamedTuple):
 
     # ── cost weights ──
     w_pos: jnp.ndarray              # (3,) per-axis position weight
-    w_vel: float                    # velocity-damping weight
+    w_vel: float                    # terminal velocity-damping weight
     w_accel: float                  # control-effort weight
     w_jerk: float                   # control-smoothness weight (Δu)
     w_terminal: float               # terminal-cost multiplier
+    w_progress: float               # reward for velocity toward reference
+    w_speed: float                  # penalty for deviating from desired_speed
+    desired_speed: float            # target cruise speed for w_speed [m/s]
 
     # ── dynamics bounds ──
     max_accel: float                # maximum acceleration [m/s²]
@@ -88,11 +91,40 @@ def default_mpc_config(params: MultirotorParams) -> MPCConfig:
         w_accel=0.5,
         w_jerk=1.0,
         w_terminal=4.0,
+        w_progress=0.0,             # off by default (tracking mode)
+        w_speed=0.0,                # off by default
+        desired_speed=0.0,
         max_accel=float(max_accel),
         max_vel=5.0,
         cruise_speed=3.5,
         setpoint_steps=8,           # 8 × 0.05 s = 0.4 s → ~1.4 m ahead
         dt_ctrl=0.02,               # 50 Hz re-solve rate
+    )
+
+
+def racing_mpc_config(params: MultirotorParams) -> MPCConfig:
+    """Aggressive config for gate racing — maximise speed, cut corners."""
+    max_tilt_rad = float(jnp.deg2rad(50.0))           # steeper tilt
+    max_accel = params.gravity * jnp.tan(max_tilt_rad) # ≈ 11.7 m/s²
+
+    return MPCConfig(
+        horizon=20,
+        dt_mpc=0.05,
+        n_iters=8,
+        lr=0.15,
+        w_pos=jnp.array([6.0, 6.0, 12.0]),           # lighter tracking
+        w_vel=0.5,                                     # don't brake hard at horizon
+        w_accel=0.1,                                   # allow aggressive manoeuvres
+        w_jerk=0.2,                                    # allow snappy transitions
+        w_terminal=3.0,
+        w_progress=4.0,                                # reward speed toward ref
+        w_speed=1.5,                                   # track desired cruise speed
+        desired_speed=4.0,                             # 4 m/s cruise target
+        max_accel=float(max_accel),
+        max_vel=8.0,                                   # higher speed cap
+        cruise_speed=5.0,                              # faster reference generation
+        setpoint_steps=10,                             # further lookahead
+        dt_ctrl=0.02,
     )
 
 
@@ -133,10 +165,22 @@ def _total_cost(u_plan, x0, ref_pos, config):
 
         pos_err = x[:3] - rp
         du = u - u_prev
+        vel = x[3:6]
 
+        # ── tracking + regularisation ──
         c = (jnp.sum(config.w_pos * pos_err ** 2)
              + config.w_accel * jnp.sum(u ** 2)
              + config.w_jerk * jnp.sum(du ** 2))
+
+        # ── progress reward: velocity aligned with direction to reference ──
+        dir_to_ref = rp - x[:3]
+        dist = jnp.linalg.norm(dir_to_ref) + 1e-6
+        dir_hat = dir_to_ref / dist
+        c = c - config.w_progress * jnp.dot(vel, dir_hat)
+
+        # ── speed tracking: penalise deviation from desired cruise speed ──
+        speed = jnp.linalg.norm(vel) + 1e-6
+        c = c + config.w_speed * (speed - config.desired_speed) ** 2
 
         x_next = _di_step(x, u, config.dt_mpc, config.max_vel)
         return (x_next, u), c
