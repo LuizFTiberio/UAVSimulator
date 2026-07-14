@@ -100,11 +100,17 @@ Rotor forces can come from one of three interchangeable models, selected with th
 | Model | How it works | Speed (quadcopter, CPU) |
 |-------|--------------|-------------------------|
 | `SIMPLE` | Algebraic `T = kt·ω²`, `Q = km·ω²`. Default; no extra dependencies. | ~1.3× realtime |
-| `BEM_LIVE` | Solves blade-element momentum equations every step via [CCBlade JAX](https://github.com/WISDEM/CCBlade), capturing inflow, blade geometry, and airfoil polars. | ~0.3× realtime |
+| `BEM_LIVE` | Solves blade-element momentum equations every step via CCBlade JAX, capturing inflow, blade geometry, and airfoil polars. | ~0.3× realtime |
 | `BEM_TABLE` | Trilinear interpolation into a thrust/torque table pre-computed from the BEM solver. Matches `BEM_LIVE` to under 1% on a waypoint mission. | ~1.0× realtime |
 
 The BEM models need the optional `ccblade-jax` package (`pip install -e ".[bem]"`) and
-`jax.config.update("jax_enable_x64", True)` before import. Attach a `BEMConfig` to
+`jax.config.update("jax_enable_x64", True)` before import. CCBlade JAX is a JAX
+reimplementation of [CCBlade.jl](https://github.com/byuflowlab/ccblade.jl) (Andrew Ning,
+BYU FLOW Lab), validated against the Julia package as ground truth; cite the original
+method as Ning, S. A. (2014), *A simple solution method for the blade element momentum
+equations with guaranteed convergence*, Wind Energy 17(9), 1327–1345.
+
+Attach a `BEMConfig` to
 `MultirotorParams.bem_config`, then bind the model into the wrench function:
 
 ```python
