@@ -24,9 +24,13 @@ class VehicleModel:
         MuJoCo actuator names for visual prop spin (optional).
     spin_signs : tuple of float
         Spin direction sign per actuator for visual prop spin (optional).
+    mjcf_xml : str or None
+        Inline MJCF XML string.  When set, takes precedence over ``mjcf_path``
+        so callers can embed a modified model without writing a temp file.
     """
     params: Any
     mjcf_path: Path
     compute_wrench: Callable
     actuator_names: tuple[str, ...] = ()
     spin_signs: tuple[float, ...] = ()
+    mjcf_xml: str | None = None

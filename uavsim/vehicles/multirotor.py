@@ -6,7 +6,11 @@ import jax.numpy as jnp
 
 from uavsim.core.types import BodyDragParams, MultirotorParams, VehicleState
 from uavsim.core.math import quat_to_rotation_matrix
-from uavsim.dynamics.propulsion import compute_rotor_wrench, throttle_to_omega
+from uavsim.dynamics.propulsion import (
+    PropulsionModel,
+    compute_rotor_wrench_dispatch,
+    throttle_to_omega,
+)
 from uavsim.vehicles.base import VehicleModel
 
 # Default body drag for a quadcopter frame
@@ -21,16 +25,18 @@ def multirotor_wrench(
     params: MultirotorParams,
     wind_velocity: jnp.ndarray = jnp.zeros(3),
     drag: BodyDragParams = _DEFAULT_DRAG,
+    propulsion_model: PropulsionModel = PropulsionModel.SIMPLE,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Compute world-frame force and torque for a multirotor.
 
     Parameters
     ----------
-    state : VehicleState (only quaternion is used)
+    state : VehicleState (only quaternion and velocity are used)
     motor_commands : (n_motors,) normalised throttle [0, 1]
-    params : MultirotorParams
+    params : MultirotorParams; set params.bem_config for BEM modes
     wind_velocity : (3,) world-frame wind velocity [m/s]
     drag : BodyDragParams  body aerodynamic drag parameters
+    propulsion_model : PropulsionModel  selects kt/km, live BEM, or table BEM
 
     Returns
     -------
@@ -38,14 +44,19 @@ def multirotor_wrench(
     T_world : (3,) net torque in world frame [N·m]
     """
     omega = throttle_to_omega(motor_commands, params.max_omega)
-    force_body, torque_body = compute_rotor_wrench(omega, params)
     R = quat_to_rotation_matrix(state.quaternion)
+
+    # Body-frame airspeed — needed by BEM and body-drag alike
+    v_air_world = state.velocity - wind_velocity
+    v_air_body = R.T @ v_air_world
+
+    force_body, torque_body = compute_rotor_wrench_dispatch(
+        omega, v_air_body, params.rotor_yaw_sign, params, propulsion_model
+    )
+
     F_rotor = R @ force_body
     T_rotor = R @ torque_body
 
-    # Body drag from relative airspeed
-    v_air_world = state.velocity - wind_velocity
-    v_air_body = R.T @ v_air_world
     speed = jnp.linalg.norm(v_air_body)
     F_drag_body = -0.5 * drag.rho * drag.Cd * drag.frontal_area * speed * v_air_body
     F_drag_world = R @ F_drag_body
