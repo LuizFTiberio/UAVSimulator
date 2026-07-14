@@ -34,3 +34,9 @@ Thumbs.db
 
 # Generated images
 *.png
+
+# MuJoCo runtime log
+MUJOCO_LOG.TXT
+
+# Claude Code local settings (machine-specific paths)
+.claude/

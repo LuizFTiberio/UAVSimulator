@@ -46,6 +46,8 @@ class MuJoCoSimulator:
         self.wind_model = wind_model
         if mjcf_override is not None:
             self.model = mujoco.MjModel.from_xml_string(mjcf_override)
+        elif vehicle.mjcf_xml is not None:
+            self.model = mujoco.MjModel.from_xml_string(vehicle.mjcf_xml)
         else:
             self.model = mujoco.MjModel.from_xml_path(str(vehicle.mjcf_path))
         self.data = mujoco.MjData(self.model)

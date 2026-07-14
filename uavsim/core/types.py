@@ -4,7 +4,7 @@ All containers are NamedTuples so they work as JAX pytrees
 out of the box (jit, grad, vmap, etc.).
 """
 
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import jax.numpy as jnp
 
@@ -32,6 +32,7 @@ class MultirotorParams(NamedTuple):
     motor_positions: jnp.ndarray   # (n_motors, 3) body frame [m]
     rotor_yaw_sign: jnp.ndarray   # (n_motors,) +1 CCW, -1 CW
     arm_length: float              # motor arm length [m]
+    bem_config: Any = None         # BEMConfig from propulsion_bem; None → SIMPLE model
 
 
 # ── PID controller ───────────────────────────────────────────────────────────
