@@ -103,12 +103,18 @@ Rotor forces can come from one of three interchangeable models, selected with th
 | `BEM_LIVE` | Solves blade-element momentum equations every step via CCBlade JAX, capturing inflow, blade geometry, and airfoil polars. | ~0.3× realtime |
 | `BEM_TABLE` | Trilinear interpolation into a thrust/torque table pre-computed from the BEM solver. Matches `BEM_LIVE` to under 1% on a waypoint mission. | ~1.0× realtime |
 
-The BEM models need the optional `ccblade-jax` package (`pip install -e ".[bem]"`) and
-`jax.config.update("jax_enable_x64", True)` before import. CCBlade JAX is a JAX
-reimplementation of [CCBlade.jl](https://github.com/byuflowlab/ccblade.jl) (Andrew Ning,
-BYU FLOW Lab), validated against the Julia package as ground truth; cite the original
-method as Ning, S. A. (2014), *A simple solution method for the blade element momentum
-equations with guaranteed convergence*, Wind Energy 17(9), 1327–1345.
+The BEM models need [`ccblade-jax`](https://github.com/LuizFTiberio/ccblade-jax), which
+is not on PyPI — install it from git:
+
+```bash
+pip install git+https://github.com/LuizFTiberio/ccblade-jax.git
+```
+
+Call `jax.config.update("jax_enable_x64", True)` before importing it. CCBlade JAX is a
+JAX reimplementation of [CCBlade.jl](https://github.com/byuflowlab/ccblade.jl) (Andrew
+Ning, BYU FLOW Lab), validated against the Julia package as ground truth; cite the
+original method as Ning, S. A. (2014), *A simple solution method for the blade element
+momentum equations with guaranteed convergence*, Wind Energy 17(9), 1327–1345.
 
 Attach a `BEMConfig` to
 `MultirotorParams.bem_config`, then bind the model into the wrench function:
@@ -135,7 +141,7 @@ vehicle = dataclasses.replace(
 | `numpy` ≥ 1.24 | Array utilities |
 | `matplotlib` ≥ 3.6 | Plotting (optional) |
 | `gymnasium` ≥ 0.29 | RL environment (optional) |
-| `ccblade-jax` | Blade-element momentum propulsion (optional, `[bem]`) |
+| `ccblade-jax` | Blade-element momentum propulsion (optional, install from git) |
 | `pytest` ≥ 7.0 | Testing (optional) |
 
 ## Tests
