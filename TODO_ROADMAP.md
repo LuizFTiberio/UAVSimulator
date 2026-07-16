@@ -170,6 +170,72 @@ explicit state machine).
 
 ---
 
+## Phase D — Robust measured-acceleration INDI outer loop
+
+**Goal:** Make the *measured-acceleration* INDI outer loop
+(`uavsim/controllers/tailsitter_indi.py`, `use_indi_outer=True`) hold as
+tightly as the model-based default, so the outer loop gets INDI's aero-error
+rejection (the paper's Sec. 4 point) instead of relying on a model of
+gravity/aero. Deferred out of Phase A on purpose: the inner INDI loop is the
+core contribution and the model-based outer loop already flies the full
+transition, so this is a refinement, not a blocker.
+
+**Current state (end of Phase A):** the measured-accel outer loop is *stable*
+but holds loosely -- it settles with a steady-state tilt (~`b1z` 0.72 vs the
+model-based loop's ~1.0) and a small position offset. Two things are already
+known:
+- The thrust-vector baseline MUST be the hover thrust `m*g` (the `T = 9.81`
+  assumption in dronesim's `_INDIPositionControl` / Paparazzi). Using the
+  *modeled* thrust as the baseline made `|omega|` diverge; `m*g` fixed the
+  divergence. So the remaining looseness is NOT the thrust baseline.
+- The looseness is the Sec. 4.1 non-minimum-phase / cascade-bandwidth
+  problem: near hover `m*g*b1` dominates the small `m*(a_ref - a_meas)`
+  correction, so the attitude reference is nearly self-referential and leans
+  entirely on a timely, low-lag `a_meas` -- which a raw finite-difference +
+  first-order low-pass of velocity can't provide against the aggressive inner
+  loop.
+
+**Already tried and ruled out (don't redo):**
+- Frame bug in `a_meas`: no -- confirmed MuJoCo `qvel[0:3]` is world-frame.
+- Elevon-lift high-pass subtraction (Phase A step 7, Sec. 4.1 option b): no
+  measurable effect here, so the dominant issue is measurement lag, not the
+  elevon-lift transient.
+- Gain/filter sweeps (softer outer gains, larger `filt_tau`): reduce but do
+  not remove the tilt.
+
+**Steps:**
+1. **Better acceleration estimation.** Replace the first-order finite-diff +
+   LPF with the paper's 2nd-order Butterworth on the accelerometer signal,
+   matched in cutoff/phase to the actuator/command filter (Smeur's whole
+   INDI hinges on the gyro/accel and the command filters being
+   *synchronised*). Consider a complementary filter that blends the noisy
+   finite-difference `a_meas` with the modeled specific force (model at high
+   frequency where the finite-difference is noisy, measurement at low
+   frequency where it's trustworthy) -- this is the principled way to get a
+   fast *and* clean `a_meas`.
+2. **Thrust estimation.** Keep the stabilising `m*g` baseline near hover, but
+   schedule/estimate the actual thrust magnitude as airspeed grows (in cruise
+   the thrust vector is far from `m*g` in both magnitude and direction). A
+   slow, low-passed thrust estimate (from the throttle->thrust map / BEM
+   table, or from `m*f_meas - F_aero_model` along `b1`) that never introduces
+   the fast jitter that made the raw modeled thrust diverge.
+3. **Explicit timescale separation.** Set the outer-loop bandwidth well below
+   the inner rate loop's, and verify it (the two were too close in Phase A).
+4. **Optional model+measurement blend for the thrust-vector direction.** Near
+   hover, fall back toward the model-based restoring term (which is dead-on);
+   as airspeed/aero grows, weight the measurement more (where INDI's
+   aero-rejection actually earns its keep). A complementary blend, not a hard
+   switch.
+5. **Test:** the measured-accel outer loop should (a) hold hover as tightly as
+   the model-based default (`pos_err < ~0.1 m`, `b1z > 0.98`, `|omega|` small),
+   AND (b) track the Phase A transition at least as well as the model-based
+   loop -- ideally *better* on altitude hold during the fast leg (the
+   model-based loop climbs to ~3 m because it ignores wing lift; measured
+   `a_meas` should catch that and hold altitude). That altitude-hold
+   improvement is the concrete win that justifies the loop.
+
+---
+
 ## Notes / open questions to revisit
 
 - Real `km`, `prop_y_offset`, and propwash `zeta_f` are still not real
