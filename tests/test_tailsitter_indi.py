@@ -19,6 +19,7 @@ from uavsim.controllers.tailsitter_indi import (
     composite_inertia_from_model,
     indi_effectiveness,
     default_tailsitter_indi_gains,
+    desired_attitude_transition,
 )
 
 
@@ -95,6 +96,70 @@ class TestEffectiveness:
         G_move, _ = indi_effectiveness(moving, u, params, inertia_inv)
         assert not np.allclose(np.asarray(G_rest), np.asarray(G_move), atol=1e-3)
 
+    def test_effectiveness_smooth_and_conditioned_across_envelope(self, params, sim_and_inertia):
+        """Sanity-sweep G over pitch angle (hover->cruise) and airspeed (roadmap
+        step 5): it must stay finite, well-conditioned, and vary SMOOTHLY --
+        this is what lets a single recomputed-every-step G span the envelope
+        with no scheduling. Also checks the qualitative INDI expectation that
+        elevon PITCH authority grows with airspeed (the freestream term the
+        propwash-only hover case lacks)."""
+        _, I = sim_and_inertia
+        inertia_inv = jnp.asarray(np.linalg.inv(I))
+        u = jnp.array([0.6, 0.6, 0.0, 0.0])
+
+        thetas = np.linspace(0.0, np.pi / 2, 10)   # nose-up (hover) -> nose-fwd
+        speeds = np.linspace(0.0, 15.0, 8)
+        conds, pitch_elevon = [], []
+        G_prev = None
+        for th in thetas:
+            for V in speeds:
+                q = _quat_from_axis_angle([0, 1, 0], -(np.pi / 2 - th))
+                # airspeed along world +x (forward): body sees it per attitude
+                st = VehicleState(jnp.zeros(3), q, jnp.array([V, 0.0, 0.0]),
+                                  jnp.zeros(3), 0.0)
+                G, _ = indi_effectiveness(st, u, params, inertia_inv)
+                G = np.asarray(G)
+                assert np.all(np.isfinite(G))
+                conds.append(np.linalg.cond(G))
+                # pitch row (1) vs elevon columns (2,3)
+                pitch_elevon.append(abs(G[1, 2]) + abs(G[1, 3]))
+                if G_prev is not None:
+                    # smoothness: adjacent-in-speed G entries shouldn't jump
+                    step = np.max(np.abs(G - G_prev))
+                    assert step < 500.0, f"G jumped by {step} (theta={th:.2f}, V={V:.1f})"
+                G_prev = G
+            G_prev = None  # don't compare across the theta seam
+
+        assert max(conds) < 5000.0, f"G ill-conditioned somewhere: cond={max(conds):.0f}"
+        # elevon pitch authority at high speed should exceed that at hover
+        pe = np.array(pitch_elevon).reshape(len(thetas), len(speeds))
+        assert pe[:, -1].mean() > pe[:, 0].mean(), \
+            "elevon pitch authority should grow with airspeed"
+
+
+class TestTransitionAttitude:
+
+    def test_reduces_to_hover_construction(self):
+        """desired_attitude_transition must match the hover-only TRIAD for the
+        vertical thrust axis (so it's a safe drop-in), and give identity for a
+        horizontal (cruise) thrust axis without degenerating."""
+        from uavsim.controllers.tailsitter_hover import (
+            desired_attitude_from_thrust_direction)
+        b1_hover = jnp.array([0.0, 0.0, 1.0])
+        R_new = np.asarray(desired_attitude_transition(b1_hover, 0.0))
+        R_old = np.asarray(desired_attitude_from_thrust_direction(b1_hover, 0.0))
+        assert np.allclose(R_new, R_old, atol=1e-6)
+        assert np.allclose(R_new.T @ R_new, np.eye(3), atol=1e-6)
+
+    def test_nondegenerate_at_horizontal_thrust_axis(self):
+        """The failure mode of the hover construction: b1 horizontal (cruise).
+        The span-axis construction must stay a proper rotation there."""
+        b1_cruise = jnp.array([1.0, 0.0, 0.0])
+        R = np.asarray(desired_attitude_transition(b1_cruise, 0.0))
+        assert np.allclose(R.T @ R, np.eye(3), atol=1e-6)
+        assert np.isclose(np.linalg.det(R), 1.0, atol=1e-6)
+        assert np.allclose(R[:, 0], [1.0, 0.0, 0.0], atol=1e-6)
+
 
 # ── closed-loop (drop-in mirror of the hover controller tests) ───────────────
 
@@ -148,6 +213,67 @@ class TestClosedLoopHover:
         assert pos_err < 0.5, f"did not hold position: pos_err={pos_err:.2f} m"
 
 
+class TestTransition:
+
+    def test_hover_forward_flight_hover_no_mode_switch(self, params, sim_and_inertia):
+        """Roadmap step 8, the Phase A payoff: the SAME controller (no mode
+        switch, no gain schedule) flies hover -> accelerate to forward flight
+        -> decelerate -> hover, just by tracking a moving velocity reference.
+        The continuous per-step G is what makes this one controller.
+
+        The vehicle pitches well over toward horizontal at speed and returns to
+        nose-up hover at the end; success = it never diverges, actually builds
+        forward speed, and recovers a stable hover."""
+        import mujoco
+        sim, I = sim_and_inertia
+        ctrl = TailsitterINDIController(params, inertia=I, dt=sim.dt,
+                                        mass=sim.total_mass)  # model-based outer loop
+        sim.reset()
+        q_hover = _quat_from_axis_angle([0, 1, 0], -jnp.pi / 2)
+        sim.data.qpos[3:7] = np.asarray(q_hover)
+        sim.data.qpos[0:3] = np.array([0.0, 0.0, 2.0])
+        mujoco.mj_forward(sim.model, sim.data)
+        state = sim.get_state()
+        ctrl.reset()
+
+        V, dt = 6.0, sim.dt
+
+        def vel_ref(t):  # trapezoidal forward-speed profile
+            if t < 1.0:   return 0.0
+            if t < 4.0:   return V * (t - 1.0) / 3.0
+            if t < 7.0:   return V
+            if t < 10.0:  return V * (1.0 - (t - 7.0) / 3.0)
+            return 0.0
+
+        x_ref, v_prev, max_speed = 0.0, 0.0, 0.0
+        max_pitch = 0.0
+        for k in range(13000):  # 13 s
+            t = k * dt
+            vx = vel_ref(t)
+            ax = (vx - v_prev) / dt
+            v_prev = vx
+            x_ref += vx * dt
+            cmds = ctrl.update(state, jnp.array([x_ref, 0.0, 2.0]),
+                               setpoint_velocity=np.array([vx, 0.0, 0.0]),
+                               accel_feedforward=np.array([ax, 0.0, 0.0]))
+            state = sim.step(cmds)
+            assert bool(jnp.all(jnp.isfinite(state.position))), f"diverged at t={t:.2f}"
+            max_speed = max(max_speed, float(state.velocity[0]))
+            b1 = np.asarray(quat_to_rotation_matrix(state.quaternion)[:, 0])
+            max_pitch = max(max_pitch, float(np.degrees(np.arctan2(b1[0], b1[2]))))
+
+        # actually transitioned: built real forward speed and pitched well over
+        assert max_speed > 4.0, f"did not build forward speed: {max_speed:.1f} m/s"
+        assert max_pitch > 30.0, f"did not pitch toward cruise: {max_pitch:.1f} deg"
+
+        # recovered a stable nose-up hover at the end
+        b1_end = np.asarray(quat_to_rotation_matrix(state.quaternion)[:, 0])
+        assert b1_end[2] > 0.9, f"did not return to hover attitude: b1.z={b1_end[2]:.2f}"
+        assert float(state.velocity[0]) < 0.5, "did not decelerate back to hover"
+        assert float(jnp.linalg.norm(state.angular_velocity)) < 1.0, "not settled"
+        assert abs(float(state.position[2]) - 2.0) < 1.0, "lost too much altitude"
+
+
 class TestAllocationBackends:
 
     def test_pinv_and_wls_both_stabilise_hover(self, params, sim_and_inertia):
@@ -169,3 +295,33 @@ class TestAllocationBackends:
                 state = sim.step(ctrl.update(state, setpoint))
             pos_err = float(jnp.linalg.norm(state.position - setpoint))
             assert pos_err < 0.6, f"use_wls={use_wls}: pos_err={pos_err:.2f} m"
+
+
+class TestExperimentalINDIOuter:
+
+    def test_measured_accel_outer_loop_stays_bounded(self, params, sim_and_inertia):
+        """The measured-acceleration INDI outer loop (use_indi_outer=True) is
+        experimental and holds less tightly than the model-based default, but
+        with the m*g hover-thrust baseline it must at least stay BOUNDED (not
+        diverge) -- a regression guard on that fix (using the modeled thrust as
+        the baseline instead made |omega| run away)."""
+        import mujoco
+        sim, I = sim_and_inertia
+        ctrl = TailsitterINDIController(params, inertia=I, dt=sim.dt,
+                                        mass=sim.total_mass, use_indi_outer=True)
+        sim.reset()
+        q_hover = _quat_from_axis_angle([0, 1, 0], -jnp.pi / 2)
+        sim.data.qpos[3:7] = np.asarray(q_hover)
+        sim.data.qpos[0:3] = np.array([0.0, 0.0, 2.0])
+        mujoco.mj_forward(sim.model, sim.data)
+        state = sim.get_state()
+        ctrl.reset()
+
+        setpoint = jnp.array([0.0, 0.0, 2.0])
+        for _ in range(3000):
+            state = sim.step(ctrl.update(state, setpoint))
+            assert bool(jnp.all(jnp.isfinite(state.position)))
+
+        # bounded (not diverging): stays in the neighbourhood, rate not growing
+        assert float(jnp.linalg.norm(state.position - setpoint)) < 1.5
+        assert float(jnp.linalg.norm(state.angular_velocity)) < 1.5

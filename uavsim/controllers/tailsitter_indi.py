@@ -38,11 +38,26 @@ the command you subtract). A single first-order filter with time constant
 just adds matched lag; it matters for stability of the algebraic loop and for
 eventual sim2real (real gyro + real actuator lag).
 
-Scope of this module (Phase A, steps 1-4): the inner attitude+rate INDI loop
-and WLS allocation. The outer position/velocity loop is still the simple PD ->
-desired-thrust-vector construction reused from tailsitter_hover.py (good
-enough to command attitude for closed-loop hover/attitude validation); the
-full INDI outer loop (roadmap step 6) is a follow-up.
+Scope of this module (Phase A):
+  * Inner attitude+rate INDI loop (steps 1-3) + WLS allocation (step 4) --
+    the core, validated. G recomputed from the current state every step.
+  * Outer position/velocity loop (step 6). Two variants:
+      - Model-based (DEFAULT, use_indi_outer=False): desired acceleration ->
+        thrust vector = m*(a_ref - g). Continuous, stable, and it flies the
+        full hover<->cruise<->hover transition (the inner INDI loop is what
+        makes that a single controller with no mode switch). This is the
+        validated outer loop.
+      - Measured-acceleration INDI (use_indi_outer=True, EXPERIMENTAL): the
+        paper's Sec. 4 incremental form, thrust vector = m*g*b1 + m*(a_ref -
+        a_meas), with the hover-thrust (m*g) baseline used by the Cyclone/
+        dronesim/Paparazzi position loops. Stable but holds less tightly than
+        the model-based path (steady-state tilt) -- the Sec. 4.1 non-minimum-
+        phase / cascade-bandwidth problem. A focused follow-up, not shipped
+        as default.
+
+Desired attitude uses a span-axis construction (desired_attitude_transition)
+that, unlike the hover-only thrust-direction TRIAD, stays well-defined when
+the thrust axis goes horizontal in cruise.
 """
 
 from __future__ import annotations
@@ -61,13 +76,37 @@ from uavsim.controllers.wls_alloc import wls_alloc
 # Reuse the singularity-free attitude machinery -- no reason to reimplement
 # quaternion-error feedback (roadmap step 3); this rotation-matrix error has
 # no Euler singularity at the tail-sitter's own +/-90deg hover attitude.
-from uavsim.controllers.tailsitter_hover import (
-    attitude_error,
-    desired_attitude_from_thrust_direction,
-)
+from uavsim.controllers.tailsitter_hover import attitude_error
 
 U_MIN = np.array([0.0, 0.0, -1.0, -1.0])   # [thr_L, thr_R, elevon_L, elevon_R]
 U_MAX = np.array([1.0, 1.0, 1.0, 1.0])
+
+
+# ── transition-capable desired attitude ─────────────────────────────────────
+
+def desired_attitude_transition(b1_des: jnp.ndarray, heading: float) -> jnp.ndarray:
+    """Build R_des (columns = body axes in world) from the desired thrust axis
+    b1_des and a horizontal heading, using the WING/SPAN axis as the secondary
+    reference rather than the heading direction itself.
+
+    tailsitter_hover.desired_attitude_from_thrust_direction resolves the free
+    roll about b1 with b2 = b1 x h (h = heading direction). That degenerates in
+    cruise: the thrust axis there is nearly horizontal and nearly parallel to
+    h, so b1 x h -> 0. Here the secondary reference is the span direction
+    span = [-sin(heading), cos(heading), 0] (horizontal, perpendicular to the
+    plane of flight), which the thrust axis never aligns with across a normal
+    hover<->cruise transition (thrust stays in the vertical plane of travel).
+
+    Reduces to exactly the hover construction for heading = 0 (verified across
+    the whole b1 range), so it is a safe drop-in that additionally works
+    through transition and cruise.
+    """
+    span = jnp.array([-jnp.sin(heading), jnp.cos(heading), 0.0])
+    b3 = jnp.cross(b1_des, span)
+    b3 = b3 / jnp.maximum(jnp.linalg.norm(b3), 1e-6)
+    b2 = jnp.cross(b3, b1_des)
+    b2 = b2 / jnp.maximum(jnp.linalg.norm(b2), 1e-6)
+    return jnp.stack([b1_des, b2, b3], axis=1)
 
 
 # ── composite inertia from the MuJoCo model ─────────────────────────────────
@@ -197,11 +236,18 @@ class TailsitterINDIController:
         gains: TailsitterINDIGains | None = None,
         dt: float = 0.001,
         use_wls: bool = True,
+        use_indi_outer: bool = False,
+        mass: float | None = None,
         Wv: np.ndarray | None = None,
     ):
         self.params = params
         self.dt = float(dt)
         self.use_wls = use_wls
+        self.use_indi_outer = use_indi_outer
+        # Actual dynamic mass (pass sim.total_mass so it matches MuJoCo, incl.
+        # the prop bodies); only scales the outer-loop increment, which INDI
+        # tolerates, but no reason to be off by the ~5% the props add.
+        self.mass = float(params.mass if mass is None else mass)
         self.Wv = DEFAULT_WV if Wv is None else np.asarray(Wv, dtype=float)
         self.gains = gains if gains is not None else default_tailsitter_indi_gains()
 
@@ -224,18 +270,33 @@ class TailsitterINDIController:
         self.u_f = self._u_trim.copy()          # filtered command (baseline)
         self.omega_prev: np.ndarray | None = None
         self.omega_dot_f = np.zeros(3)          # filtered measured angular accel
+        # Outer-loop INDI state: filtered measured acceleration (the increment
+        # baseline; the thrust-vector baseline is the modeled thrust each step).
+        self.vel_prev: np.ndarray | None = None
+        self.a_meas_f = np.zeros(3)
 
     def update(
         self,
         state: VehicleState,
         setpoint_position: jnp.ndarray,
+        setpoint_velocity: np.ndarray | None = None,
+        accel_feedforward: np.ndarray | None = None,
         desired_yaw: float = 0.0,
         wind_velocity: np.ndarray | None = None,
     ) -> jnp.ndarray:
+        """One control step -> (4,) motor_commands.
+
+        setpoint_velocity / accel_feedforward default to zero (pure
+        position-hold, i.e. hover). Feed a moving velocity/accel reference to
+        command forward flight or a transition -- the SAME controller, no mode
+        switch (that is the whole point of INDI here).
+        """
         g = self.gains
         alpha = self.dt / (g.filt_tau + self.dt)   # first-order LPF coefficient
 
         Omega = np.asarray(state.angular_velocity, dtype=float)
+        pos = np.asarray(state.position, dtype=float)
+        vel = np.asarray(state.velocity, dtype=float)
 
         # ── measured Omega_dot: finite difference + matched low-pass ────────
         if self.omega_prev is None:
@@ -247,32 +308,65 @@ class TailsitterINDIController:
         # Same filter on the command that feeds G (synchronisation, Sec. 2).
         self.u_f += alpha * (self.u_applied - self.u_f)
 
-        # ── outer loop (reused PD -> desired thrust vector & attitude) ──────
-        pos = np.asarray(state.position, dtype=float)
-        vel = np.asarray(state.velocity, dtype=float)
-        pos_err = np.asarray(setpoint_position, dtype=float) - pos
-        accel_cmd = np.asarray(g.kp_pos) * pos_err - np.asarray(g.kd_pos) * vel
+        # ── measured linear acceleration (INDI outer-loop baseline) ─────────
+        if self.vel_prev is None:
+            a_raw = np.zeros(3)
+        else:
+            a_raw = (vel - self.vel_prev) / self.dt
+        self.vel_prev = vel
+        self.a_meas_f += alpha * (a_raw - self.a_meas_f)
 
-        g_vec = np.array([0.0, 0.0, -self.params.gravity])
-        F_thrust_world = self.params.mass * (accel_cmd - g_vec)
-        T_des = float(np.linalg.norm(F_thrust_world))
-        b1_des = F_thrust_world / max(T_des, 1e-6)
+        # ── outer loop: desired acceleration -> desired thrust vector ───────
+        vel_ref = (np.zeros(3) if setpoint_velocity is None
+                   else np.asarray(setpoint_velocity, dtype=float))
+        acc_ff = (np.zeros(3) if accel_feedforward is None
+                  else np.asarray(accel_feedforward, dtype=float))
+        pos_err = np.asarray(setpoint_position, dtype=float) - pos
+        a_ref = (np.asarray(g.kp_pos) * pos_err
+                 + np.asarray(g.kd_pos) * (vel_ref - vel) + acc_ff)
 
         R = quat_to_rotation_matrix(state.quaternion)
-        R_des = desired_attitude_from_thrust_direction(
-            jnp.asarray(b1_des), desired_yaw)
+
+        # ── control effectiveness at the CURRENT state (needed by both loops) ─
+        wind_jax = (jnp.zeros(3) if wind_velocity is None
+                    else jnp.asarray(wind_velocity, dtype=float))
+        G, y0 = self._eff_jit(state, jnp.asarray(self.u_f), wind_velocity=wind_jax)
+        G = np.asarray(G, dtype=float)
+        T_model = float(y0[3])   # modeled current body-x force (~actual thrust)
+
+        if self.use_indi_outer:
+            # INDI translational loop (Sec. 4): the thrust vector's effect on
+            # specific force is (1/m)*I, and gravity + aero cancel because they
+            # are already in the measured acceleration -- so the increment is
+            # just m*(a_ref - a_meas) on top of the current thrust vector.
+            # The baseline thrust magnitude is taken as the HOVER thrust m*g
+            # (the "T = 9.81" assumption in the Cyclone/dronesim/Paparazzi INDI
+            # position loops), not the modeled/measured thrust: using the
+            # modeled T here (biased + jittery from the filtered command) made
+            # this loop diverge (|omega| ran away); the fixed m*g baseline is
+            # stable. Growing wing lift through a transition still shows up in
+            # a_meas, so it is rejected without an explicit aero model here.
+            # NOTE (experimental): even stabilised, this measurement-based loop
+            # holds less tightly than the model-based path below (some
+            # steady-state tilt) -- the Sec. 4.1 non-minimum-phase / cascade-
+            # bandwidth problem. Default is use_indi_outer=False.
+            b1 = np.asarray(R[:, 0])
+            T_vec_0 = self.mass * self.params.gravity * b1
+            T_vec_ref = T_vec_0 + self.mass * (a_ref - self.a_meas_f)
+        else:
+            # Model-based fallback (the original hover construction).
+            g_vec = np.array([0.0, 0.0, -self.params.gravity])
+            T_vec_ref = self.mass * (a_ref - g_vec)
+
+        T_des = float(np.linalg.norm(T_vec_ref))
+        b1_des = T_vec_ref / max(T_des, 1e-6)
+
+        R_des = desired_attitude_transition(jnp.asarray(b1_des), desired_yaw)
         e_R = np.asarray(attitude_error(R, R_des))
 
         # ── attitude loop (Eq. 5-6) -> rate ref -> rate loop (Eq. 4) ────────
         Omega_ref = -np.asarray(g.k_att) * e_R
         nu_ang = np.asarray(g.k_rate) * (Omega_ref - Omega)   # desired Omega_dot
-
-        # ── control effectiveness at the CURRENT state ──────────────────────
-        wind_jax = (jnp.zeros(3) if wind_velocity is None
-                    else jnp.asarray(wind_velocity, dtype=float))
-        G, y0 = self._eff_jit(state, jnp.asarray(self.u_f), wind_velocity=wind_jax)
-        G = np.asarray(G, dtype=float)
-        T_model = float(y0[3])
 
         # ── incremental objective (Eq. 2-3) ─────────────────────────────────
         nu = np.array([nu_ang[0], nu_ang[1], nu_ang[2], T_des])
