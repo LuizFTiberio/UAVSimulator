@@ -225,12 +225,31 @@ class TestCessnaStyleConstructor:
             Clp=-0.47, Cmq=-12.4, Cnr=-0.099, Cmde=-1.28, Clda=0.178,
             wingspan=0.88, chord=0.17,
         )
+        # camber (Cl0) terms negated for the body z-up frame (see assembly),
+        # so a positive-camber wing (Cl0>0) makes positive lift at alpha=0.
         expected = jnp.array([
-            [Cd0, 0.0, Cda + Cl0],
-            [0.0, Cy0, 0.0],
-            [Cl0, 0.0, -Cd0 + Cla],
+            [Cd0,  0.0, Cda - Cl0],
+            [0.0,  Cy0, 0.0],
+            [-Cl0, 0.0, -Cd0 + Cla],
         ])
         assert jnp.allclose(coeffs.Phi_fv, expected)
+
+    def test_positive_camber_gives_positive_lift_at_zero_alpha(self):
+        """Regression: a positive-camber wing (Cl0>0) must produce POSITIVE lift
+        at zero angle of attack (CL(0) = +Cl0), not a downforce. Earlier the Cl0
+        camber term entered with the paper's z-down sign and gave CL(0) = -Cl0,
+        which forced an unphysically high cruise AoA."""
+        Cl0 = 0.31
+        coeffs = cessna_style_phi_coefficients(
+            Cd0=0.031, Cda=0.13, Cla=4.6, Cl0=Cl0, Cy0=0.1,
+            Clp=-0.47, Cmq=-12.4, Cnr=-0.099, Cmde=-1.28, Clda=0.178,
+            wingspan=0.88, chord=0.17,
+        )
+        # F_body = -0.5*rho*S*|v| * Phi_fv @ v_b; at zero AoA v_b = [V,0,0], and
+        # body z is up, so lift = F_body_z = -0.5*rho*S*V^2 * Phi_fv[2,0] must be
+        # positive -> Phi_fv[2,0] must be negative (= -Cl0).
+        assert float(coeffs.Phi_fv[2, 0]) == pytest.approx(-Cl0)
+        assert float(coeffs.Phi_fv[2, 0]) < 0.0
 
     def test_not_symmetric_in_general(self):
         """Real cambered-airfoil data (nonzero Cl0) gives a non-symmetric

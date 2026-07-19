@@ -97,13 +97,42 @@ core claim (Sec. 2).
 
 ---
 
-## Phase B — Sideslip control (Sec. 3)
+## Phase B — Sideslip control (Sec. 3) — DONE (2026-07-18)
 
 **Goal:** Cyclone has no rudder/vertical tail -- nothing currently
 prevents the vehicle from picking up sideslip, which degrades wing
 efficiency and (per the paper) can reduce lift. Needs active control.
 
-**Steps:**
+**Status: complete.** Added to `uavsim/controllers/tailsitter_indi.py`
+(purely additive): `estimate_sideslip()` (ground-truth beta from body-frame
+airspeed, approach (a)), `coordinated_turn_rate()` guidance helper
+(`g*tan(phi_ref)/V`), a `k_beta` gain (default 1.5), and a
+`use_sideslip_control` flag + internal `psi_ref` heading integrator on the
+controller. When enabled, `update()` integrates `psi_dot_ref = yaw_rate_ff +
+k_beta*beta` (Eq. 17) into the heading fed to `desired_attitude_transition`,
+gated on forward speed > `V_SIDESLIP_MIN` (2 m/s). Sign verified in
+closed-loop sim (positive beta -> positive heading rate yaws the nose into the
+slip).
+
+**Key design point (matches the paper): phi in Eq. 17 is phi_REF, not the
+measured bank.** The coordinated-turn feedforward must come from the commanded
+turn (guidance-supplied `yaw_rate_ff`), NOT the vehicle's measured bank: in
+this architecture the outer loop banks to hold lateral POSITION too (crabbing
+against a crosswind), so feeding measured bank back as a turn command misfires
+(verified: it pushed a crosswind's steady sideslip from ~5deg back up to
+~20deg). `coordinated_turn_rate()` converts a commanded bank -> `yaw_rate_ff`
+for the Phase C guidance layer.
+
+**Validated (tests/test_tailsitter_indi.py::TestSideslipControl, +
+TestSideslipEstimate, TestCoordinatedTurnRate -- 7 tests, all pass):**
+- Crosswind rejection: steady +y crosswind gives sustained sideslip the
+  position loop can't remove (airspeed = ground vel - wind); enabling sideslip
+  control drives it ~15deg -> ~5deg mean.
+- Coordinated turn: a curving velocity reference at fixed heading builds ~52deg
+  sideslip; with `yaw_rate_ff` = commanded turn rate it holds ~1deg through the
+  turn.
+
+**Steps (all done):**
 1. **Sideslip estimation.** Paper uses lateral specific force from
    accelerometer feedback (Eq. 13-16, `beta = c2*f_y + b2`, fit from
    real flight data). In simulation we have ground-truth state, so we
@@ -124,7 +153,7 @@ efficiency and (per the paper) can reduce lift. Needs active control.
 
 ---
 
-## Phase C — Full mission example
+## Phase C — Full mission example — DONE (2026-07-18)
 
 **Goal:** hover → transition → cruise (with a turn) → transition → hover,
 as a single scripted demonstration using Phase A+B's controller, no
@@ -133,7 +162,39 @@ core claim -- transitions should fall out naturally from the same
 continuous controller tracking a changing reference, not from an
 explicit state machine).
 
-**Steps:**
+**Status: complete.** New reusable guidance layer
+`uavsim/controllers/tailsitter_guidance.py` (`MissionLeg`, `MissionGuidance`,
+`roadmap_mission()`): a leg-based mission (hold speed / accelerate / cruise+turn
+/ decelerate) is turned into a continuous `(position, velocity, acceleration,
+yaw, yaw_rate_ff)` reference. Horizontal velocity is `s(t)*[cos psi, sin psi]`
+with heading integrated from the leg turn rate, so the accel feedforward is
+analytic (tangential + centripetal); the turn rate is also handed to the
+controller as `yaw_rate_ff` for the coordinated turn (Phase B). `MissionGuidance`
+is stateful (reset / step(dt)), integrating reference position and heading. Unit-
+tested in `tests/test_tailsitter_guidance.py` (10 tests, all pass).
+
+Demo: `examples/tailsitter_mission_demo.py` (live MuJoCo viewer + plots, or
+`--headless` for plots only). Flies the full `roadmap_mission()` with the one
+`TailsitterINDIController` (sideslip control on), NO mode switch. Result: reaches
+6 m/s cruise, pitches to ~45 deg, holds a coordinated 180 deg turn, decelerates,
+and recovers a stable nose-up hover (b1.z=1.000, |vel| 0.06, |omega| 0.01). New
+6-panel `plot_tailsitter_mission()` in `uavsim/viz/plotting.py` mirrors the
+paper's Fig. 16-19 (ground track, altitude, pitch, speed, actuator saturation,
+sideslip; phase-shaded).
+
+**Latent sim bug fixed in passing:** `MuJoCoSimulator.get_state()` wrapped the
+`qpos`/`qvel` slices with `jnp.asarray`, which zero-copies from numpy on
+CPU/x64 -- so every `state_history` entry ALIASED the live MjData buffer and
+read back the final state (collapsing all recorded trajectories, incl. the
+existing quad `plot_flight_data` demos). Now copies the slices (`np.array`)
+before wrapping. This is why the first Phase C plots showed a single point.
+
+**Known limitation (expected, = Phase D):** the model-based outer loop ignores
+wing lift, so altitude bulges to ~3.2 m during the fast cruise leg before
+returning to 2 m. Fixing that hold is exactly Phase D's measured-accel outer
+loop.
+
+**Steps (all done):**
 1. **Guidance/reference layer** (Sec. 5 for a reference, though our
    needs are simpler for a first pass): position/waypoint -> velocity
    reference -> acceleration reference (Eq. 38's simple PD is a
@@ -170,7 +231,71 @@ explicit state machine).
 
 ---
 
-## Phase D — Robust measured-acceleration INDI outer loop
+## Phase D — Guidance INDI outer loop (with wing-lift effectiveness) — DONE (2026-07-19)
+
+**Status: complete, and solved more directly than the original plan below.** The
+real missing piece was structural, not a filtering refinement: the paper's
+*Guidance INDI* outer loop (Sec. 4, Eq. 18-33) controls linear acceleration with
+the vector `v = [phi, theta, T]` by inverting a control-effectiveness matrix
+`G = G_T + G_L` that **includes the wing-lift derivative** (`dL/dtheta`, Eq. 27-29).
+That lift term is what lets the loop trade thrust for pitch -- pitch the nose
+over, let the wing carry the weight, pull thrust back. The measured-accel
+thrust-VECTOR loop (`use_indi_outer`) has no lift term, which is why it held
+loosely; the model-based loop has neither lift nor measurement.
+
+**Implemented** in `uavsim/controllers/tailsitter_indi.py` (`use_guidance_indi=True`):
+- Outer control vector **`v = [phi, theta, T]`** (bank, pitch, thrust) -- the
+  paper/Paparazzi vector. `guidance_attitude(phi,theta,psi) = Rot(h,phi) @
+  desired_attitude_transition(b1(theta,psi),psi)`, h = horizontal heading axis.
+  Bank `phi` about h does DOUBLE DUTY (the paper's single roll channel): at hover
+  (b1 up) it tilts the thrust sideways (lateral authority); in cruise (b1 ~ h) it
+  rolls the LIFT vector into the turn. `phi=0` reduces to wings-level. Heading
+  `psi` stays with the Phase-B sideslip loop. (An earlier `[theta, lam=lateral-
+  thrust-tilt, T]` parameterisation with FORCED wings-level flew the straight
+  transition but diverged in the turn -- see "the turn fix" below.)
+- Two effectiveness backends: **`"jacobian"` (default)** -- `G` from `jax.jacobian`
+  of the real `phi_theory` specific force (exact `dL/dtheta` in the theta column
+  AND exact lift-ROLL in the phi column, no fitting; the "we have a model, the
+  Cyclone work didn't" advantage applied to the outer loop);
+  **`"analytic"`** -- explicit Eq. 28-33 `G` (`col_phi = (T·(h×b1)+L·(h×lift_dir))/m`,
+  `col_theta` with fitted `dL/dtheta` Eq. 33 + Sec. 4.1 `pitch_scaling`), for
+  sim2real where you can't autodiff a real aircraft. Inner G/WLS allocation untouched.
+- INDI law `dv = gain * pinv(G) @ (a_ref - a_meas_f)`, `[phi,theta]_cmd =
+  [phi0,theta0] + [dphi,dtheta]` read off the current attitude via
+  `guidance_extract_bank_pitch` (as in Cyclone/dronesim/Paparazzi guidance).
+
+**The turn fix (checked against Paparazzi `guidance_indi_hybrid_tailsitter.c`):**
+the coordinated turn is roll + yaw + sideslip that must all agree. The loop had
+yaw (sideslip `psi_ref`) and sideslip (Phase B) but **no roll** -- it tried to get
+lateral force by tilting the tiny cruise thrust (~20 % W), which has almost no
+authority while the big lift vector sat pointing straight up (wings level). The
+speed/altitude runaway in the turn was exactly that. Making **bank a native
+control channel whose G-column carries the lift** (like Paparazzi's
+`Gmat[0][0] = ... + cphi*spsi*lift`) means the coordinated-turn bank falls out of
+the same inversion -- no feedforward. Now roll+yaw+sideslip are consistent.
+
+**Validated (closed-loop + tests):** straight 12 m/s cruise -> pitch ~74 deg,
+**thrust ~22 % (props ~5 % W, wing ~95 %), altitude held ~0.1 m** vs the model
+loop's ~2.4 m climb. **FULL turning mission** (`roadmap_mission`, 12 m/s, 180 deg
+turn): speed tracks 12 m/s (was runaway to 35), **altitude held [9.3, 10.2] m
+through the turn**, **coordinated turn holds beta ~0.1 deg**, returns to hover
+(b1z 1.00). Tests in `tests/test_tailsitter_indi.py`
+(`TestGuidanceParameterization`, `TestGuidanceEffectiveness` incl.
+bank-gives-lateral-via-lift-in-cruise, `TestGuidanceINDIClosedLoop`) + all prior
+tests pass.
+
+**Key physics finding:** below ~10 m/s the wing cannot support the weight at all
+(stall-speed limit), so the props MUST carry it regardless of the controller --
+the 6 m/s demo's ~45 deg deep-stall attitude was partly physics, not just the
+blind controller. A genuine wing-borne cruise needs >=12 m/s (level trim there:
+theta~74 deg, thrust ~18% W). Demo default raised accordingly.
+
+The original narrower plan (better `a_meas` filtering on the *thrust-vector* loop)
+is superseded and kept below only for reference; the lift-aware `G` is the fix.
+
+---
+
+### (superseded) original Phase D plan — robust measured-acceleration INDI outer loop
 
 **Goal:** Make the *measured-acceleration* INDI outer loop
 (`uavsim/controllers/tailsitter_indi.py`, `use_indi_outer=True`) hold as
@@ -238,6 +363,14 @@ known:
 
 ## Notes / open questions to revisit
 
+- **Aero fix (2026-07-19): camber `Cl0` sign in `phi_theory.py`.** The wing model
+  had `Cl0` entering `Phi_fv` with the paper's z-DOWN sign while this codebase is
+  body z-UP, so a positive-camber wing made a DOWNforce at zero AoA (CL(0) = -Cl0)
+  and cruise trimmed at an unphysically high ~16 deg AoA (pitch ~74 deg). Fixed by
+  negating the `Cl0` camber terms `((3,1): -Cl0, (1,3): Cda-Cl0)`; now
+  `CL = +Cl0 + Cla*alpha`, cruise AoA ~7 deg (pitch ~83 deg), wing carries ~97 % of
+  weight. Re-validated (aero 42 + hover/transition/basic 33 tests, full mission).
+  Also flips the wing pitching moment (`Phi_mv` from `Phi_fv`) -- checked OK.
 - Real `km`, `prop_y_offset`, and propwash `zeta_f` are still not real
   data (see SESSION_SUMMARY.md) -- fine to proceed with placeholders for
   control-law development, but worth closing out before treating any

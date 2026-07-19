@@ -246,9 +246,10 @@ def cessna_style_phi_coefficients(
     e.g. a textbook/reference Cessna-class dataset), rather than a
     from-scratch symmetric thin-airfoil placeholder.
 
-    Phi_fv assembled per Eq. 45-48's structure (Cd0, Cda+Cl0, Cy0, Cl0,
-    -Cd0+Cla in the (1,1),(1,3),(2,2),(3,1),(3,3) entries -- NOT
-    symmetric in general, see PhiCoefficients docstring). Phi_fw from
+    Phi_fv assembled per Eq. 45-48's structure with the camber (Cl0) terms
+    NEGATED for this codebase's body z-up frame (see the assembly comment):
+    (Cd0, Cda-Cl0, Cy0, -Cl0, -Cd0+Cla) in the (1,1),(1,3),(2,2),(3,1),(3,3)
+    entries -- NOT symmetric in general, see PhiCoefficients docstring. Phi_fw from
     Cyp/Cyr (rate->force, usually small/zero). Phi_mw from the
     Cl_/Cm_/Cn_ {p,q,r} rate-damping set (Eq. 60). Directly-fit Clb/Cma/
     Cnb (velocity->moment, e.g. a real aircraft's tail-driven static
@@ -268,10 +269,22 @@ def cessna_style_phi_coefficients(
     test_rate_damping_opposes_rotation and chat history for how a sign
     bug here was initially caught).
     """
+    # Camber (Cl0) sign convention: this codebase uses a body z-UP frame, while
+    # the paper's phi-theory (Eq. 45-48) is written for the standard aircraft
+    # z-DOWN frame. Under z-up the camber terms flip sign relative to the paper's
+    # literal (3,1)=+Cl0 / (1,3)=Cda+Cl0: a body-z flip negates exactly the Cl0
+    # offset (the u->F_z and w->F_x camber couplings) while leaving the Cla lift
+    # SLOPE ((3,3)=-Cd0+Cla, driven by w) unchanged. With the literal +Cl0 the
+    # model produced CL = -Cl0 at zero AoA (a DOWNforce for a positive-camber
+    # wing) and a +Cl0/Cla positive zero-lift angle, forcing an unphysically high
+    # cruise AoA (~16 deg at 12 m/s vs the ~8 deg linear theory predicts). Negated
+    # here so Cl0>0 means conventional positive camber: CL = +Cl0 + Cla*alpha,
+    # positive lift at alpha=0, zero-lift angle -Cl0/Cla. Verified against a
+    # lift/drag AoA sweep (drag polar minimum at CL=0, i.e. the zero-lift angle).
     Phi_fv = jnp.array([
-        [Cd0,  0.0,  Cda + Cl0],
-        [0.0,  Cy0,  0.0],
-        [Cl0,  0.0,  -Cd0 + Cla],
+        [Cd0,   0.0,  Cda - Cl0],
+        [0.0,   Cy0,  0.0],
+        [-Cl0,  0.0,  -Cd0 + Cla],
     ])
     Phi_fw = 0.5 * jnp.array([
         [0.0,  0.0,  0.0],

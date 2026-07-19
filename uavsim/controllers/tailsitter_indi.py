@@ -72,6 +72,7 @@ import numpy as np
 from uavsim.core.types import VehicleState
 from uavsim.core.math import quat_to_rotation_matrix
 from uavsim.vehicles.tailsitter import TailsitterParams, tailsitter_wrench
+from uavsim.aero.phi_theory import phi_wing_wrench
 from uavsim.controllers.wls_alloc import wls_alloc
 # Reuse the singularity-free attitude machinery -- no reason to reimplement
 # quaternion-error feedback (roadmap step 3); this rotation-matrix error has
@@ -80,6 +81,12 @@ from uavsim.controllers.tailsitter_hover import attitude_error
 
 U_MIN = np.array([0.0, 0.0, -1.0, -1.0])   # [thr_L, thr_R, elevon_L, elevon_R]
 U_MAX = np.array([1.0, 1.0, 1.0, 1.0])
+
+# Below this forward (body-x) airspeed the sideslip angle is meaningless
+# (atan2 of a lateral component over ~zero forward speed is garbage) and the
+# g*tan(phi)/V coordinated-turn term blows up, so the sideslip loop holds its
+# heading below it. 2 m/s is comfortably into forward flight for this vehicle.
+V_SIDESLIP_MIN = 2.0
 
 
 # ── transition-capable desired attitude ─────────────────────────────────────
@@ -107,6 +114,64 @@ def desired_attitude_transition(b1_des: jnp.ndarray, heading: float) -> jnp.ndar
     b2 = jnp.cross(b3, b1_des)
     b2 = b2 / jnp.maximum(jnp.linalg.norm(b2), 1e-6)
     return jnp.stack([b1_des, b2, b3], axis=1)
+
+
+# ── sideslip estimation + coordinated-turn law (Phase B, Sec. 3) ─────────────
+
+def estimate_sideslip(
+    state: VehicleState, wind_velocity: np.ndarray = np.zeros(3),
+) -> tuple[float, float, np.ndarray]:
+    """Return (beta, V, v_body) -- sideslip angle, airspeed, body-frame airspeed.
+
+    The Cyclone has no rudder or vertical tail, so nothing passively prevents
+    sideslip; left uncontrolled it degrades wing efficiency and lift (paper
+    Sec. 3). Sideslip is a nonzero airspeed component along the SPAN axis
+    (body y -- the propellers sit at y=+/-0.3), i.e. the airflow hitting the
+    wing edge-on rather than head-on:
+
+        beta = atan2(v_body_y, v_body_x)
+
+    This uses ground-truth simulator state (roadmap Phase B step 1, approach a
+    -- "cheating" relative to a real vehicle but exact and fine for sim/RL). A
+    real Cyclone would instead reconstruct beta from the lateral specific force
+    (accelerometer, paper Eq. 13-16) -- noted as refinement (b), only needed if
+    sim2real transfer matters.
+
+    beta is only meaningful in forward flight; the caller gates on
+    v_body[0] > V_SIDESLIP_MIN (below that, forward speed ~0 makes the atan2
+    ill-defined).
+    """
+    R = np.asarray(quat_to_rotation_matrix(state.quaternion))
+    v_air_world = np.asarray(state.velocity, dtype=float) - np.asarray(wind_velocity, dtype=float)
+    v_body = R.T @ v_air_world
+    V = float(np.linalg.norm(v_body))
+    beta = float(np.arctan2(v_body[1], v_body[0]))
+    return beta, V, v_body
+
+
+def coordinated_turn_rate(bank: float, V: float, gravity: float) -> float:
+    """Coordinated-turn heading-rate feedforward (paper Eq. 17, feedforward part):
+
+        psi_dot_ff = g * tan(bank) / V
+
+    When the vehicle banks by `bank` the lift/thrust vector tilts, producing a
+    horizontal (centripetal) force g*tan(bank) per unit mass, which curves the
+    flight path at exactly g*tan(bank)/V -- so rotating the heading reference at
+    that rate keeps the nose tracking the turning velocity, holding beta~0
+    through the turn instead of picking up sideslip.
+
+    This is a GUIDANCE-side helper: pass the result as `yaw_rate_ff` to
+    TailsitterINDIController.update(). It is deliberately NOT computed from the
+    vehicle's *measured* bank inside the loop, because in this architecture bank
+    is emergent -- the outer loop banks to hold lateral POSITION (e.g. crabbing
+    against a crosswind), not only to turn -- so feeding measured bank back as a
+    turn command misfires and actually degrades sideslip regulation (verified:
+    measured-bank feedforward pushed a crosswind's steady sideslip from ~5deg
+    back up to ~20deg). The turn rate must come from the commanded path (Phase C
+    guidance), which is what this helper expresses.
+    """
+    V_eff = max(V, V_SIDESLIP_MIN)   # guard the 1/V feedforward at low speed
+    return gravity * np.tan(bank) / V_eff
 
 
 # ── composite inertia from the MuJoCo model ─────────────────────────────────
@@ -193,6 +258,185 @@ def indi_effectiveness(
     return jax.jacobian(y)(u0), y(u0)
 
 
+# ── Guidance INDI outer loop (paper Sec. 4, Eq. 18-33) ───────────────────────
+#
+# The paper's outer loop is ALSO INDI: it controls linear acceleration with the
+# control vector v = [phi, theta, T] (bank, pitch, thrust) by inverting a
+# control-effectiveness matrix G = G_T + G_L that -- crucially -- includes the
+# derivative of WING LIFT w.r.t. pitch (Eq. 27-29). That lift term is what lets
+# the controller trade thrust for pitch: pitch the nose over, let the wing pick
+# up the weight, and pull thrust back. The model-based outer loop (default
+# above) has no lift term, so it can only cancel gravity with thrust -- which is
+# why it never unloads onto the wing and the props keep carrying the weight in
+# cruise.
+#
+#     v = v_f + m (G_T + G_L)^-1 (xi_ddot_ref - xi_ddot_meas)          (Eq. 30)
+#
+# Parameterisation note (differs from the paper's frame, same idea): our thrust
+# is along body-x (b1) and hover is nose-up, so the paper's roll-tilts-thrust
+# does not map 1:1 (a bank ABOUT b1 makes no lateral force at hover, where lift
+# ~ 0). We instead parameterise the thrust-axis DIRECTION by two tilt angles --
+# theta (fore-aft, the angle-of-attack / lift driver) and lam (lateral) -- plus
+# the thrust magnitude T. This spans 3D acceleration at hover AND cruise
+# (verified well-conditioned across the envelope), and theta still carries the
+# lift derivative exactly as the paper's theta does. Heading psi stays owned by
+# the Phase-B sideslip loop ("psi is not free to choose", paper Sec. 4).
+#
+# Two effectiveness backends:
+#   * "jacobian" (DEFAULT): G = jax.jacobian of the REAL specific force
+#     (phi_theory + propulsion) w.r.t. [theta, lam, T] at the current state.
+#     Exact lift derivative, continuous across the envelope, no fitting -- the
+#     "we have a model, the Cyclone work didn't" advantage, applied to the
+#     outer loop (same trick the inner loop already uses for its G).
+#   * "analytic": the paper's Eq. 28-33 form, assembled explicitly from a
+#     simplified thrust+lift model with a FITTED lift slope (Eq. 33) and the
+#     Sec. 4.1 pitch-effectiveness over-statement. No autodiff of the true
+#     plant -- the path you need for a real vehicle, where you cannot jacobian
+#     an unknown aircraft's aerodynamics. Less accurate here, kept for sim2real.
+
+def _heading_axis(psi: float) -> jnp.ndarray:
+    """Horizontal forward (heading) axis -- the bank/roll axis (see below)."""
+    return jnp.array([jnp.cos(psi), jnp.sin(psi), 0.0])
+
+
+def _rot_about_axis(axis: jnp.ndarray, angle: float) -> jnp.ndarray:
+    """Rodrigues rotation matrix about a unit `axis` by `angle`."""
+    a = axis
+    K = jnp.array([[0.0, -a[2], a[1]],
+                   [a[2], 0.0, -a[0]],
+                   [-a[1], a[0], 0.0]])
+    return (jnp.eye(3) + jnp.sin(angle) * K
+            + (1.0 - jnp.cos(angle)) * (K @ K))
+
+
+def guidance_thrust_axis(theta: float, psi: float) -> jnp.ndarray:
+    """World-frame thrust axis b1 for pitch-from-vertical `theta`, heading `psi`
+    (zero bank): b1 = [sin(theta) cos(psi), sin(theta) sin(psi), cos(theta)].
+    theta=0 -> straight up (hover); theta=pi/2 -> horizontal along heading."""
+    return jnp.array([jnp.sin(theta) * jnp.cos(psi),
+                      jnp.sin(theta) * jnp.sin(psi),
+                      jnp.cos(theta)])
+
+
+def guidance_attitude(phi: float, theta: float, psi: float) -> jnp.ndarray:
+    """Desired attitude R for the outer control vector [phi (bank), theta
+    (pitch), psi (heading)].
+
+        R = Rot(h, phi) @ desired_attitude_transition(b1(theta, psi), psi)
+
+    where h = horizontal heading axis. Bank `phi` is a roll about h -- which
+    does DOUBLE DUTY, exactly as the paper's single roll channel: at hover
+    (b1 up) rolling about the horizontal h tilts the thrust axis sideways
+    (lateral thrust authority); in cruise (b1 ~ h) it rolls the wing/lift
+    vector into the turn (banked coordinated turn). phi=0 reduces to the
+    wings-level construction, so it is a safe superset of the earlier attitude.
+    """
+    b1 = guidance_thrust_axis(theta, psi)
+    R0 = desired_attitude_transition(b1, psi)          # wings level
+    return _rot_about_axis(_heading_axis(psi), phi) @ R0
+
+
+def guidance_extract_bank_pitch(R: jnp.ndarray, psi: float) -> tuple[float, float]:
+    """Inverse of guidance_attitude: recover (phi, theta) from a world attitude
+    R at heading psi -- the INDI baseline v_f (increment added to current state).
+
+    theta comes from the bank-invariant projection b1.h = sin(theta) (rolling
+    about h leaves it unchanged, so this is valid across the whole envelope,
+    incl. cruise where bank does not move b1). phi is then the rotation about h
+    that maps the wings-level reference R0(theta, psi) onto R.
+    """
+    h = _heading_axis(psi)
+    b1 = R[:, 0]
+    theta = jnp.arcsin(jnp.clip(jnp.dot(b1, h), -1.0, 1.0))
+    R0 = desired_attitude_transition(guidance_thrust_axis(theta, psi), psi)
+    M = R @ R0.T                                        # = Rot(h, phi)
+    vee = jnp.array([M[2, 1] - M[1, 2], M[0, 2] - M[2, 0], M[1, 0] - M[0, 1]])
+    sin_phi = 0.5 * jnp.dot(vee, h)
+    cos_phi = 0.5 * (jnp.trace(M) - 1.0)
+    phi = jnp.arctan2(sin_phi, cos_phi)
+    return phi, theta
+
+
+def _rot_to_quat(R: jnp.ndarray) -> jnp.ndarray:
+    """Rotation matrix -> quaternion [w,x,y,z], differentiable for rotation
+    angles < 180 deg (always true in normal flight); single-branch trace form."""
+    w = 0.5 * jnp.sqrt(jnp.maximum(1.0 + R[0, 0] + R[1, 1] + R[2, 2], 1e-12))
+    x = (R[2, 1] - R[1, 2]) / (4.0 * w)
+    y = (R[0, 2] - R[2, 0]) / (4.0 * w)
+    z = (R[1, 0] - R[0, 1]) / (4.0 * w)
+    return jnp.array([w, x, y, z])
+
+
+def guidance_accel(
+    phi: float, theta: float, T: float, psi: float,
+    velocity: jnp.ndarray, params: TailsitterParams, mass: float,
+    wind_velocity: jnp.ndarray = jnp.zeros(3),
+) -> jnp.ndarray:
+    """World-frame specific force (acceleration) as a function of the outer-loop
+    control vector [phi (bank), theta (pitch), T (thrust)], using the REAL
+    phi_theory + propulsion model at the given airspeed. jax.jacobian of this
+    gives the "jacobian" effectiveness G = d(accel)/d[phi, theta, T].
+
+    Because the attitude is built with a genuine bank (guidance_attitude), the
+    phi-column of G AUTOMATICALLY carries the lift-roll term -- banking rolls the
+    wing, phi_theory returns the tilted lift -- so the coordinated turn falls out
+    of the inversion (matching Paparazzi's Gmat[0][*] 'lift'/'liftd' entries), no
+    feedforward. Elevons held at zero (inner-loop control); rate zero (quasi-
+    static force balance).
+    """
+    R = guidance_attitude(phi, theta, psi)
+    q = _rot_to_quat(R)
+    st = VehicleState(position=jnp.zeros(3), quaternion=q,
+                      velocity=velocity, angular_velocity=jnp.zeros(3), time=0.0)
+    thrust_pp = jnp.array([T / 2.0, T / 2.0])
+    F_aero, _ = phi_wing_wrench(st, params.phi_wing, thrust_pp,
+                                jnp.zeros(2), wind_velocity)
+    g_vec = jnp.array([0.0, 0.0, -params.gravity])
+    return g_vec + (F_aero + T * R[:, 0]) / mass
+
+
+def guidance_effectiveness_analytic(
+    phi: float, theta: float, T: float, psi: float, V: float,
+    mass: float, gravity: float, lift_slope: float, pitch_scaling: float,
+) -> jnp.ndarray:
+    """Paparazzi/paper Eq. 28-33 effectiveness assembled explicitly (no autodiff
+    of the plant) -- the sim2real backend. Columns are d(accel)/d[phi, theta, T].
+
+    Thrust vector T*b1 and a lift vector L*lift_dir (L ~ mg*sin(theta), rolled
+    with the bank), both built with a genuine bank so the phi-column carries the
+    LIFT (like Paparazzi's Gmat[0][0] = ... + cphi*spsi*lift):
+      * d/dphi   = (T (h x b1) + L (h x lift_dir)) / m     -- bank rotates thrust
+        (hover) and lift (cruise) about h -> lateral/turn authority.
+      * d/dtheta = (T db1/dtheta - pitch_scaling*lift_slope * lift_dir) / m
+        -- thrust rotation + the FITTED lift slope (Eq. 33, negative in this
+        convention, see the jacobian backend), scaled by the Sec. 4.1 fudge.
+      * d/dT     = b1 / m.
+    """
+    h = _heading_axis(psi)
+    Rphi = _rot_about_axis(h, phi)
+    b1_0 = guidance_thrust_axis(theta, psi)
+    b1 = Rphi @ b1_0
+    up = jnp.array([0.0, 0.0, 1.0])
+    lift_dir = Rphi @ up                                # wings-level lift ~ up, rolled
+    L = mass * gravity * jnp.sin(theta)                 # crude lift magnitude (Eq. 31)
+
+    db1_0_dtheta = jnp.array([jnp.cos(theta) * jnp.cos(psi),
+                              jnp.cos(theta) * jnp.sin(psi),
+                              -jnp.sin(theta)])
+    db1_dtheta = Rphi @ db1_0_dtheta
+
+    col_phi = (T * jnp.cross(h, b1) + L * jnp.cross(h, lift_dir)) / mass
+    col_theta = (T * db1_dtheta - pitch_scaling * lift_slope * lift_dir) / mass
+    col_T = b1 / mass
+    return jnp.stack([col_phi, col_theta, col_T], axis=1)
+
+
+def paper_lift_slope(V: float, mass: float) -> float:
+    """Paper Eq. 33: dL/dtheta scheduled by airspeed (their flight-test fit).
+    Returned as a positive magnitude of d|Lift|/dtheta [N/rad]."""
+    return float(np.where(V < 12.0, 24.0 * mass, (V - 8.5) * 6.88 * mass))
+
+
 # ── gains ───────────────────────────────────────────────────────────────────
 
 class TailsitterINDIGains(NamedTuple):
@@ -201,6 +445,7 @@ class TailsitterINDIGains(NamedTuple):
     k_att: jnp.ndarray    # (3,) attitude loop: e_R -> Omega_ref  (Eq. 5-6)
     k_rate: jnp.ndarray   # (3,) rate loop: rate error -> Omega_dot_ref (Eq. 4)
     filt_tau: float       # (s) low-pass time constant, gyro-diff AND command
+    k_beta: float = 1.5   # sideslip feedback gain (Phase B, Eq. 17)
 
 
 def default_tailsitter_indi_gains() -> TailsitterINDIGains:
@@ -210,6 +455,7 @@ def default_tailsitter_indi_gains() -> TailsitterINDIGains:
         k_att=jnp.array([8.0, 8.0, 4.0]),
         k_rate=jnp.array([18.0, 18.0, 10.0]),
         filt_tau=0.02,
+        k_beta=1.5,
     )
 
 
@@ -237,6 +483,11 @@ class TailsitterINDIController:
         dt: float = 0.001,
         use_wls: bool = True,
         use_indi_outer: bool = False,
+        use_guidance_indi: bool = False,
+        guidance_effectiveness: str = "jacobian",
+        guidance_gain: float = 0.5,
+        pitch_scaling: float = 1.0,
+        use_sideslip_control: bool = False,
         mass: float | None = None,
         Wv: np.ndarray | None = None,
     ):
@@ -244,6 +495,27 @@ class TailsitterINDIController:
         self.dt = float(dt)
         self.use_wls = use_wls
         self.use_indi_outer = use_indi_outer
+        # Guidance INDI outer loop (paper Sec. 4): commands [theta, lam, T] via
+        # an effectiveness matrix that INCLUDES the wing-lift derivative, so it
+        # unloads weight onto the wing in cruise (unlike the model-based and
+        # measured-accel outer loops, which have no lift term). Backend:
+        # "jacobian" (default, exact G from phi_theory) or "analytic" (paper
+        # Eq. 28-33 fitted form, for sim2real). Takes precedence over
+        # use_indi_outer when set.
+        self.use_guidance_indi = use_guidance_indi
+        if guidance_effectiveness not in ("jacobian", "analytic"):
+            raise ValueError("guidance_effectiveness must be 'jacobian' or 'analytic'")
+        self.guidance_effectiveness = guidance_effectiveness
+        self.guidance_gain = float(guidance_gain)
+        # Sec. 4.1 non-minimum-phase over-statement of pitch effectiveness (the
+        # analytic backend's "scaling" factor; the paper uses 2.0). Only used by
+        # the analytic backend.
+        self.pitch_scaling = float(pitch_scaling)
+        # Phase B: regulate sideslip by integrating the coordinated-turn +
+        # sideslip-feedback heading-rate law (Eq. 17) into the heading reference
+        # fed to desired_attitude_transition. When off, desired_yaw is used
+        # directly (hover/manual heading) exactly as before.
+        self.use_sideslip_control = use_sideslip_control
         # Actual dynamic mass (pass sim.total_mass so it matches MuJoCo, incl.
         # the prop bodies); only scales the outer-loop increment, which INDI
         # tolerates, but no reason to be off by the ~5% the props add.
@@ -255,6 +527,15 @@ class TailsitterINDIController:
         inertia_inv = jnp.asarray(np.linalg.inv(self.inertia))
         self._eff_jit = jax.jit(
             partial(indi_effectiveness, params=params, inertia_inv=inertia_inv))
+
+        # Outer-loop (guidance) effectiveness G = d(accel)/d[phi, theta, T],
+        # jax.jacobian of the real specific force, jitted once (jacobian backend).
+        def _guid_accel(phi, theta, T, psi, velocity, wind):
+            return guidance_accel(phi, theta, T, psi, velocity, params,
+                                  self.mass, wind)
+        self._guid_G_jit = jax.jit(
+            jax.jacobian(_guid_accel, argnums=(0, 1, 2)))
+        self._guid_accel_jit = jax.jit(_guid_accel)
 
         # Hover-trim command as the initial baseline so the first increment is
         # small (same trim throttle compute_hover_mixer uses).
@@ -274,6 +555,14 @@ class TailsitterINDIController:
         # baseline; the thrust-vector baseline is the modeled thrust each step).
         self.vel_prev: np.ndarray | None = None
         self.a_meas_f = np.zeros(3)
+        # Phase B: integrated heading reference (lazily seeded from the first
+        # desired_yaw) and last sideslip estimate (exposed for logging).
+        self.psi_ref: float | None = None
+        self.beta = 0.0
+        # Guidance INDI commanded outer state (exposed for logging/plots).
+        self.outer_theta = 0.0
+        self.outer_phi = 0.0
+        self.outer_T = self.mass * self.params.gravity
 
     def update(
         self,
@@ -282,6 +571,7 @@ class TailsitterINDIController:
         setpoint_velocity: np.ndarray | None = None,
         accel_feedforward: np.ndarray | None = None,
         desired_yaw: float = 0.0,
+        yaw_rate_ff: float = 0.0,
         wind_velocity: np.ndarray | None = None,
     ) -> jnp.ndarray:
         """One control step -> (4,) motor_commands.
@@ -290,6 +580,15 @@ class TailsitterINDIController:
         position-hold, i.e. hover). Feed a moving velocity/accel reference to
         command forward flight or a transition -- the SAME controller, no mode
         switch (that is the whole point of INDI here).
+
+        desired_yaw is the heading reference for desired_attitude_transition.
+        With use_sideslip_control=True (Phase B) it is only the INITIAL heading:
+        the controller then integrates the sideslip-feedback law (Eq. 17) each
+        step -- psi_dot_ref = yaw_rate_ff + k_beta*beta -- and drives the heading
+        itself to hold beta ~ 0 (needs a nonzero wind_velocity or forward flight
+        for sideslip to exist). yaw_rate_ff is the coordinated-turn feedforward
+        the guidance is commanding (rad/s; use coordinated_turn_rate() to get it
+        from a desired bank); it is ignored when use_sideslip_control=False.
         """
         g = self.gains
         alpha = self.dt / (g.filt_tau + self.dt)   # first-order LPF coefficient
@@ -334,34 +633,77 @@ class TailsitterINDIController:
         G = np.asarray(G, dtype=float)
         T_model = float(y0[3])   # modeled current body-x force (~actual thrust)
 
-        if self.use_indi_outer:
-            # INDI translational loop (Sec. 4): the thrust vector's effect on
-            # specific force is (1/m)*I, and gravity + aero cancel because they
-            # are already in the measured acceleration -- so the increment is
-            # just m*(a_ref - a_meas) on top of the current thrust vector.
-            # The baseline thrust magnitude is taken as the HOVER thrust m*g
-            # (the "T = 9.81" assumption in the Cyclone/dronesim/Paparazzi INDI
-            # position loops), not the modeled/measured thrust: using the
-            # modeled T here (biased + jittery from the filtered command) made
-            # this loop diverge (|omega| ran away); the fixed m*g baseline is
-            # stable. Growing wing lift through a transition still shows up in
-            # a_meas, so it is rejected without an explicit aero model here.
-            # NOTE (experimental): even stabilised, this measurement-based loop
-            # holds less tightly than the model-based path below (some
-            # steady-state tilt) -- the Sec. 4.1 non-minimum-phase / cascade-
-            # bandwidth problem. Default is use_indi_outer=False.
-            b1 = np.asarray(R[:, 0])
-            T_vec_0 = self.mass * self.params.gravity * b1
-            T_vec_ref = T_vec_0 + self.mass * (a_ref - self.a_meas_f)
+        # ── heading reference (needed BEFORE the outer loop: the guidance loop
+        # resolves attitude in this heading frame). Sideslip control (Phase B,
+        # Sec. 3) integrates the coordinated-turn + beta-feedback law into it;
+        # otherwise desired_yaw is the heading directly. ─────────────────────
+        heading = desired_yaw
+        if self.use_sideslip_control:
+            if self.psi_ref is None:
+                self.psi_ref = float(desired_yaw)   # seed from the initial heading
+            wind_np = (np.zeros(3) if wind_velocity is None
+                       else np.asarray(wind_velocity, dtype=float))
+            self.beta, V_air, v_body = estimate_sideslip(state, wind_np)
+            # gate the beta feedback on forward (body-x) airspeed: below it
+            # sideslip is undefined. The commanded turn feedforward still applies
+            # (it comes from guidance, not from measured flow).
+            beta_fb = g.k_beta * self.beta if v_body[0] > V_SIDESLIP_MIN else 0.0
+            self.psi_ref += (yaw_rate_ff + beta_fb) * self.dt
+            heading = self.psi_ref
+
+        # ── outer loop: desired acceleration -> (thrust magnitude, attitude) ────
+        if self.use_guidance_indi:
+            # Guidance INDI (paper Sec. 4 / Paparazzi guidance_indi_hybrid): invert
+            # the outer effectiveness G = d(accel)/d[phi, theta, T] against the
+            # measured-acceleration error. G's theta-column carries the lift
+            # derivative (unloads weight onto the wing), and its phi-column carries
+            # the lift-ROLL (banking the wing into a turn), so BOTH pitch-to-lift
+            # and the coordinated-turn bank fall out of the same inversion -- no
+            # feedforward. Baseline v_f = [phi0, theta0, T0] is read off the CURRENT
+            # attitude + thrust (cmd = current + increment, as in dronesim/Paparazzi).
+            phi0, theta0 = guidance_extract_bank_pitch(jnp.asarray(R), heading)
+            T0 = T_model
+            vel_jax = jnp.asarray(vel)
+            if self.guidance_effectiveness == "jacobian":
+                d = self._guid_G_jit(phi0, theta0, T0, heading, vel_jax, wind_jax)
+                Gp = np.stack([np.asarray(d[0]), np.asarray(d[1]),
+                               np.asarray(d[2])], axis=1)
+            else:
+                V_air = float(np.linalg.norm(
+                    vel - (np.zeros(3) if wind_velocity is None
+                           else np.asarray(wind_velocity, dtype=float))))
+                Gp = np.asarray(guidance_effectiveness_analytic(
+                    phi0, theta0, T0, heading, V_air, self.mass,
+                    self.params.gravity, paper_lift_slope(V_air, self.mass),
+                    self.pitch_scaling))
+            dv = self.guidance_gain * (np.linalg.pinv(Gp) @ (a_ref - self.a_meas_f))
+            phi_c = float(np.clip(float(phi0) + dv[0], np.radians(-60.0), np.radians(60.0)))
+            theta_c = float(np.clip(float(theta0) + dv[1], 0.0, np.radians(100.0)))
+            T_des = float(max(T0 + dv[2], 0.0))
+            R_des = guidance_attitude(phi_c, theta_c, heading)
+            self.outer_theta, self.outer_phi, self.outer_T = theta_c, phi_c, T_des
         else:
-            # Model-based fallback (the original hover construction).
-            g_vec = np.array([0.0, 0.0, -self.params.gravity])
-            T_vec_ref = self.mass * (a_ref - g_vec)
+            if self.use_indi_outer:
+                # Measured-acceleration INDI thrust-VECTOR loop (experimental,
+                # kept for comparison). Thrust vector's effect on specific force
+                # is (1/m)*I; gravity + aero are already in a_meas, so the
+                # increment is m*(a_ref - a_meas) on the current thrust vector.
+                # Baseline is the HOVER thrust m*g (the "T = 9.81" Cyclone/
+                # dronesim/Paparazzi assumption): using the modeled T here made
+                # it diverge. It has NO lift term, so it holds loosely in cruise
+                # (steady-state tilt) -- the reason the guidance loop above
+                # exists. Default off.
+                b1 = np.asarray(R[:, 0])
+                T_vec_0 = self.mass * self.params.gravity * b1
+                T_vec_ref = T_vec_0 + self.mass * (a_ref - self.a_meas_f)
+            else:
+                # Model-based fallback (the original hover construction; no aero).
+                g_vec = np.array([0.0, 0.0, -self.params.gravity])
+                T_vec_ref = self.mass * (a_ref - g_vec)
+            T_des = float(np.linalg.norm(T_vec_ref))
+            b1_des = T_vec_ref / max(T_des, 1e-6)
+            R_des = desired_attitude_transition(jnp.asarray(b1_des), heading)
 
-        T_des = float(np.linalg.norm(T_vec_ref))
-        b1_des = T_vec_ref / max(T_des, 1e-6)
-
-        R_des = desired_attitude_transition(jnp.asarray(b1_des), desired_yaw)
         e_R = np.asarray(attitude_error(R, R_des))
 
         # ── attitude loop (Eq. 5-6) -> rate ref -> rate loop (Eq. 4) ────────
