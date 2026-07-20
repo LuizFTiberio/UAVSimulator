@@ -1,0 +1,99 @@
+<?xml version="1.0" ?>
+<!--
+  Tail-sitter model for MuJoCo >= 3.0
+
+  Dual-engine tail-sitting flying wing, matching the physical configuration
+  the phi-theory aerodynamic model (uavsim/aero/phi_theory.py) is validated
+  against (Lustosa, Defay, Moschetta, JGCD 2019): 2 propellers mounted at the
+  wing leading edge, thrust along body +X, one elevon per wing half.
+
+  Body axes: +X forward (thrust axis), +Z down, standard aircraft convention
+  (matches uavsim/dynamics/aerodynamics.py's u/w convention). In hover the
+  vehicle sits nose-up, i.e. world +Z roughly aligned with body -X; MuJoCo
+  doesn't need to know this -- it's purely a consequence of the commanded
+  attitude via xfrc_applied torques.
+
+  Wing: 1.2 m span, AR 8 (chord 0.15 m), matching the geometry used in
+  uavsim/aero/tests/test_phi_theory.py's example params, so a first sim run
+  can reuse those same numbers.
+
+  Thrust & aero forces are applied via xfrc_applied in Python (tailsitter_wrench).
+  Motor/elevon joints below are cosmetic (visual prop spin only); elevon
+  deflection has no MuJoCo actuator (not needed for a purely visual cue here).
+-->
+<mujoco model="tailsitter">
+
+  <compiler inertiafromgeom="auto" angle="radian"/>
+
+  <option timestep="0.001" gravity="0 0 -9.81" integrator="RK4"/>
+
+  <visual>
+    <headlight ambient="0.4 0.4 0.4" diffuse="0.6 0.6 0.6" specular="0.1 0.1 0.1"/>
+    <map shadowclip="1" shadowscale="0.6"/>
+    <quality shadowsize="2048"/>
+    <global offwidth="1280" offheight="720"/>
+  </visual>
+
+  <asset>
+    <texture name="skybox" type="skybox" builtin="gradient"
+             rgb1="0.4 0.6 0.8" rgb2="0.8 0.9 1.0" width="512" height="512"/>
+    <texture name="tex_ground" type="2d" builtin="checker"
+             rgb1="0.45 0.45 0.45" rgb2="0.55 0.55 0.55" width="512" height="512"/>
+    <material name="mat_ground" texture="tex_ground" texrepeat="10 10"
+              specular="0.1" shininess="0.1" reflectance="0.0"/>
+    <material name="mat_body"   rgba="0.15 0.20 0.80 1" specular="0.5" shininess="0.7"/>
+    <material name="mat_motor"  rgba="0.10 0.10 0.10 1" specular="0.3"/>
+    <material name="mat_rotor"  rgba="0.85 0.15 0.15 0.75" specular="0.2"/>
+    <material name="mat_wing"   rgba="0.90 0.90 0.90 0.9" specular="0.3" shininess="0.5"/>
+    <material name="mat_elevon" rgba="0.9 0.3 0.3 0.8" specular="0.2"/>
+  </asset>
+
+  <worldbody>
+    <!-- Ground plane — 120 m radius -->
+    <geom name="ground" type="plane" size="120 120 0.1" material="mat_ground" pos="0 0 0"/>
+
+    <!-- Main tail-sitter body -->
+    <body name="body" pos="0 0 0.9">
+      <freejoint name="root"/>
+
+      <!-- Central fuselage (compact) -->
+      <inertial pos="0 0 0" mass="1.2" diaginertia="0.018 0.006 0.020"/>
+      <geom name="body_geom" type="box" size="0.06 0.04 0.02" material="mat_body"/>
+
+      <!-- ========== Wing (1.2 m span, chord 0.15 m) ========== -->
+      <!-- half-chord = 0.075, half-span = 0.6 -->
+      <geom name="wing" type="box" size="0.075 0.6 0.008"
+            pos="0 0 0.0" material="mat_wing"/>
+
+      <!-- Elevons (visual) — one per wing half, hinged at wing trailing edge -->
+      <geom name="elevon_left"  type="box" size="0.02 0.28 0.004"
+            pos="-0.09 -0.3 0.0" material="mat_elevon"/>
+      <geom name="elevon_right" type="box" size="0.02 0.28 0.004"
+            pos="-0.09  0.3 0.0" material="mat_elevon"/>
+
+      <!-- ---- Left motor + rotor (thrust along +X, leading edge, y=-0.3) ---- -->
+      <geom name="motor_left_geom" type="cylinder" size="0.012"
+            fromto="0.06 -0.3 0  0.09 -0.3 0" material="mat_motor"/>
+      <body name="prop_left_body" pos="0.09 -0.3 0.0" euler="0 1.5708 0">
+        <inertial pos="0 0 0" mass="0.03" diaginertia="3e-5 3e-5 3e-5"/>
+        <joint name="rotor_left" type="hinge" axis="0 0 1" limited="false" damping="1e-4"/>
+        <geom name="prop_left" type="cylinder" size="0.126 0.002" material="mat_rotor"/>
+      </body>
+
+      <!-- ---- Right motor + rotor (thrust along +X, leading edge, y=+0.3) ---- -->
+      <geom name="motor_right_geom" type="cylinder" size="0.012"
+            fromto="0.06 0.3 0  0.09 0.3 0" material="mat_motor"/>
+      <body name="prop_right_body" pos="0.09 0.3 0.0" euler="0 1.5708 0">
+        <inertial pos="0 0 0" mass="0.03" diaginertia="3e-5 3e-5 3e-5"/>
+        <joint name="rotor_right" type="hinge" axis="0 0 1" limited="false" damping="1e-4"/>
+        <geom name="prop_right" type="cylinder" size="0.126 0.002" material="mat_rotor"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <motor name="act_left"  joint="rotor_left"  gear="0.01" ctrlrange="-1 1"/>
+    <motor name="act_right" joint="rotor_right" gear="0.01" ctrlrange="-1 1"/>
+  </actuator>
+
+</mujoco>

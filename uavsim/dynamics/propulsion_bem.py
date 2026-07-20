@@ -14,6 +14,8 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from typing import NamedTuple, Any
 
+from uavsim.core.math import safe_norm
+
 try:
     from bem.core import solve_rotor_oblique
     _HAS_BEM = True
@@ -45,17 +47,31 @@ class BEMTableParams(NamedTuple):
 
 def _velocity_decomposition(
     v_air_body: jax.Array,
+    rotor_axis: jax.Array = jnp.array([0.0, 0.0, 1.0]),
 ) -> tuple[jax.Array, jax.Array]:
     """Map body-frame airspeed to (V_inf, alpha_tilt) for solve_rotor_oblique.
 
-    Convention (z-up body frame, rotors face up):
-      Vx  = -v_air_body[2]  — axial inflow into disk (+Vx = air enters from above)
-      V_lateral = ||v_air_body[:2]||  — lateral component
-      alpha_tilt — angle between rotor axis and freestream [0, π/2]
+    rotor_axis : (3,) unit vector, the rotor's spin/thrust axis in body
+        frame. Default [0,0,1] preserves the original quad/quadplane
+        convention (rotors face up) -- for a tail-sitter (thrust along
+        body +x), pass rotor_axis=[1,0,0].
+
+    Generalizes the original hardcoded-Z decomposition via projection onto
+    an arbitrary axis instead of fixed component indexing:
+      Vx        = dot(v_air_body, rotor_axis)      — axial inflow
+      V_lateral = ||v_air_body - Vx*rotor_axis||    — perpendicular component
+      alpha_tilt — angle between rotor axis and freestream [0, pi]
+    Reduces EXACTLY to the original for rotor_axis=[0,0,1]: original had
+    Vx=-v_air_body[2] (opposite sign to dot(v,[0,0,1])=v_air_body[2]), but
+    alpha_tilt only ever uses |Vx|, and Vx itself is never returned or
+    passed to solve_rotor_oblique (which only takes V_inf, alpha_tilt) --
+    so the sign difference is inert; |Vx| and alpha_tilt are identical
+    either way. Checked directly rather than assumed.
     """
-    Vx = -v_air_body[2]
-    V_lateral = jnp.linalg.norm(v_air_body[:2])
-    V_inf = jnp.linalg.norm(v_air_body)
+    Vx = jnp.dot(v_air_body, rotor_axis)
+    v_lateral_vec = v_air_body - Vx * rotor_axis
+    V_lateral = safe_norm(v_lateral_vec)
+    V_inf = safe_norm(v_air_body)
     alpha_tilt = jnp.arctan2(V_lateral, jnp.maximum(jnp.abs(Vx), 1e-6))
     return V_inf, alpha_tilt
 
@@ -106,13 +122,18 @@ def compute_rotor_wrench_bem(
     rotor_yaw_sign: jax.Array,     # (n_motors,) ±1
     bem_config: BEMConfig,
     motor_positions: jax.Array,    # (n_motors, 3) motor CoM positions [m]
+    rotor_axis: jax.Array = jnp.array([0.0, 0.0, 1.0]),
 ) -> tuple[jax.Array, jax.Array]:
     """Compute rotor wrench via live BEM solve (vmapped over motors).
 
+    rotor_axis : (3,) unit vector, thrust/spin axis in body frame. Default
+        [0,0,1] (quad/quadplane convention, unchanged). For a tail-sitter
+        (thrust along body +x), pass rotor_axis=[1,0,0].
+
     Returns
     -------
-    force_body  : (3,) [N]   — [0, 0, sum(T)]
-    torque_body : (3,) [N·m] — pitch/roll moments from differential thrust + yaw drag
+    force_body  : (3,) [N]   — sum(T) * rotor_axis
+    torque_body : (3,) [N·m] — pitch/roll moments from differential thrust + reaction torque about rotor_axis
     """
     if not _HAS_BEM:
         raise ImportError(
@@ -120,7 +141,7 @@ def compute_rotor_wrench_bem(
             "  export PYTHONPATH=/path/to/CCBlade_jax:$PYTHONPATH"
         )
 
-    V_inf, alpha_tilt = _velocity_decomposition(v_air_body)
+    V_inf, alpha_tilt = _velocity_decomposition(v_air_body, rotor_axis)
 
     def _solve_one(omega_i: jax.Array) -> tuple[jax.Array, jax.Array]:
         result = solve_rotor_oblique(
@@ -132,32 +153,38 @@ def compute_rotor_wrench_bem(
 
     T_per_rotor, Q_per_rotor = jax.vmap(_solve_one)(omega)
 
-    force_body = jnp.zeros(3).at[2].set(jnp.sum(T_per_rotor))
+    force_body = jnp.sum(T_per_rotor) * rotor_axis
 
-    # Pitch/roll moments: cross(arm_i, [0, 0, T_i]) — same as SIMPLE model
-    thrust_vecs = jnp.zeros_like(motor_positions).at[:, 2].set(T_per_rotor)
+    # Pitch/roll/yaw moments: cross(arm_i, T_i * rotor_axis) — same as
+    # SIMPLE model, generalized from the fixed .at[:,2] indexing.
+    thrust_vecs = T_per_rotor[:, None] * rotor_axis[None, :]
     torque_body = jnp.sum(jnp.cross(motor_positions, thrust_vecs), axis=0)
-    torque_body = torque_body.at[2].add(jnp.sum(rotor_yaw_sign * Q_per_rotor))
+    torque_body = torque_body + jnp.sum(rotor_yaw_sign * Q_per_rotor) * rotor_axis
     return force_body, torque_body
 
 
 # ── BEM_TABLE ────────────────────────────────────────────────────────────────
 
-def compute_rotor_wrench_bem_table(
+def lookup_bem_table_per_rotor(
     omega: jax.Array,              # (n_motors,) [rad/s]
     v_air_body: jax.Array,         # (3,) body-frame airspeed [m/s]
-    rotor_yaw_sign: jax.Array,     # (n_motors,) ±1
     table_params: BEMTableParams,
-    motor_positions: jax.Array,    # (n_motors, 3) motor CoM positions [m]
+    rotor_axis: jax.Array = jnp.array([0.0, 0.0, 1.0]),
 ) -> tuple[jax.Array, jax.Array]:
-    """Compute rotor wrench via trilinear lookup table.
+    """Per-rotor (T, Q) from the table, WITHOUT assembling a wrench.
+
+    Factored out of compute_rotor_wrench_bem_table so callers that need
+    each rotor's own thrust separately -- e.g. to feed a propwash-coupled
+    aero model like uavsim/aero/phi_theory.py's per-section propeller
+    assignment -- don't have to duplicate the lookup. Added additively;
+    compute_rotor_wrench_bem_table's own signature/behavior is unchanged,
+    it just calls this internally now.
 
     Returns
     -------
-    force_body  : (3,) [N]
-    torque_body : (3,) [N·m] — pitch/roll moments from differential thrust + yaw drag
+    T_per_rotor, Q_per_rotor : (n_motors,) each
     """
-    V_inf, alpha_tilt = _velocity_decomposition(v_air_body)
+    V_inf, alpha_tilt = _velocity_decomposition(v_air_body, rotor_axis)
 
     def _lookup_one(omega_i: jax.Array) -> tuple[jax.Array, jax.Array]:
         T = _trilinear_interp(
@@ -172,14 +199,38 @@ def compute_rotor_wrench_bem_table(
         )
         return T, Q
 
-    T_per_rotor, Q_per_rotor = jax.vmap(_lookup_one)(omega)
+    return jax.vmap(_lookup_one)(omega)
 
-    force_body = jnp.zeros(3).at[2].set(jnp.sum(T_per_rotor))
 
-    # Pitch/roll moments: cross(arm_i, [0, 0, T_i]) — same as SIMPLE model
-    thrust_vecs = jnp.zeros_like(motor_positions).at[:, 2].set(T_per_rotor)
+def compute_rotor_wrench_bem_table(
+    omega: jax.Array,              # (n_motors,) [rad/s]
+    v_air_body: jax.Array,         # (3,) body-frame airspeed [m/s]
+    rotor_yaw_sign: jax.Array,     # (n_motors,) ±1
+    table_params: BEMTableParams,
+    motor_positions: jax.Array,    # (n_motors, 3) motor CoM positions [m]
+    rotor_axis: jax.Array = jnp.array([0.0, 0.0, 1.0]),
+) -> tuple[jax.Array, jax.Array]:
+    """Compute rotor wrench via trilinear lookup table.
+
+    rotor_axis : (3,) unit vector, thrust/spin axis in body frame. Default
+        [0,0,1] (quad/quadplane convention, unchanged). For a tail-sitter
+        (thrust along body +x), pass rotor_axis=[1,0,0]. The table itself
+        (built by build_bem_table) is axis-agnostic -- alpha_tilt is
+        purely rotor-relative -- so the SAME table works for any
+        rotor_axis; only this consumption step needed generalizing.
+
+    Returns
+    -------
+    force_body  : (3,) [N]
+    torque_body : (3,) [N·m] — pitch/roll moments from differential thrust + reaction torque about rotor_axis
+    """
+    T_per_rotor, Q_per_rotor = lookup_bem_table_per_rotor(omega, v_air_body, table_params, rotor_axis)
+
+    force_body = jnp.sum(T_per_rotor) * rotor_axis
+
+    thrust_vecs = T_per_rotor[:, None] * rotor_axis[None, :]
     torque_body = jnp.sum(jnp.cross(motor_positions, thrust_vecs), axis=0)
-    torque_body = torque_body.at[2].add(jnp.sum(rotor_yaw_sign * Q_per_rotor))
+    torque_body = torque_body + jnp.sum(rotor_yaw_sign * Q_per_rotor) * rotor_axis
     return force_body, torque_body
 
 

@@ -100,12 +100,20 @@ class MuJoCoSimulator:
     # ── state ────────────────────────────────────────────────────────────
 
     def get_state(self) -> VehicleState:
-        """Return the current vehicle state as a VehicleState NamedTuple."""
+        """Return the current vehicle state as a VehicleState NamedTuple.
+
+        The qpos/qvel slices are copied (np.array) before wrapping: on CPU with
+        x64, jnp.asarray zero-copies from numpy, which would alias the mutable
+        MjData buffers -- every snapshot (e.g. in state_history) would then read
+        back the LATEST qpos, collapsing any recorded trajectory to its final
+        value. Copying breaks that aliasing so recorded states are true
+        snapshots.
+        """
         return VehicleState(
-            position=jnp.asarray(self.data.qpos[0:3]),
-            quaternion=jnp.asarray(self.data.qpos[3:7]),
-            velocity=jnp.asarray(self.data.qvel[0:3]),
-            angular_velocity=jnp.asarray(self.data.qvel[3:6]),
+            position=jnp.asarray(np.array(self.data.qpos[0:3])),
+            quaternion=jnp.asarray(np.array(self.data.qpos[3:7])),
+            velocity=jnp.asarray(np.array(self.data.qvel[0:3])),
+            angular_velocity=jnp.asarray(np.array(self.data.qvel[3:6])),
             time=float(self.data.time),
         )
 
