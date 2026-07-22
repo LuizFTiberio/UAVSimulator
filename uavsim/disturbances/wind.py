@@ -155,25 +155,39 @@ class DrydenWind(WindModel):
         sigmas = np.array([p.sigma_u, p.sigma_v, p.sigma_w])
         Ls = np.array([p.Lu, p.Lv, p.Lw])
 
-        # White-noise input
+        # White-noise input (one unit-variance draw per axis per step)
         noise = self._rng.standard_normal(3)
 
-        # Per-axis Tustin (bilinear) discretisation of H(s) = K / (s + a)
-        # where a = V/L, K = σ √(2V / (πL))
+        # Per-axis EXACT discretisation of the first-order shaping filter
+        # H(s) = K/(s + a),  a = V/L,  driven by continuous white noise.
+        #
+        # This used to be a Tustin discretisation fed with a raw N(0,1) draw.
+        # That is wrong for a CONTINUOUS-time white-noise input: the per-step
+        # driving noise of a continuous white process sampled at dt has
+        # variance 1/dt, not 1, so the missing 1/sqrt(dt) made the realised
+        # turbulence both far too weak AND timestep-dependent -- measured
+        # sigma_u = 0.008 m/s at dt=1ms for a requested 1.5 m/s (~180x too
+        # small), growing as sqrt(dt). DrydenWind was effectively a no-op, so
+        # "flying with turbulence" was really flying with mean wind only.
+        #
+        # The exact-discretisation AR(1) below is dt-independent by
+        # construction and reproduces both the requested intensity and the
+        # filter's correlation time tau = L/V:
+        #
+        #     x[n] = rho x[n-1] + sigma sqrt(1 - rho^2) n[n],   rho = exp(-a dt)
+        #
+        # so Var(x) -> sigma^2 and Corr(x[n], x[n+k]) = exp(-a k dt) exactly.
+        # NOTE the normalisation convention: sigma is taken to be the realised
+        # standard deviation of the turbulence (what MIL-HDBK-1797's intensity
+        # tables and this class's docstring mean by it). Deriving the gain
+        # straight from the Dryden PSD with a unit-PSD noise source instead
+        # lands on sigma^2/pi, which is the usual Dryden normalisation trap --
+        # we deliberately calibrate to the intensity users actually ask for.
         for i in range(3):
             a = V / Ls[i]
-            K = sigmas[i] * np.sqrt(2.0 * V / (np.pi * Ls[i]))
-
-            # Bilinear: s → (2/dt)(z-1)/(z+1)
-            # H(z) = K · dt / (2 + a·dt) · (z + 1) / (z - (2 - a·dt)/(2 + a·dt))
-            alpha = (2.0 - a * dt) / (2.0 + a * dt)
-            beta = K * dt / (2.0 + a * dt)
-
-            # y[n] = alpha * y[n-1] + beta * (x[n] + x[n-1])
-            # We use noise as the combined (x[n] + x[n-1]) ≈ 2·noise for simplicity
-            # (white noise is uncorrelated, so this just scales the gain by √2,
-            #  which we absorb into the overall calibration)
-            self._state[i] = alpha * self._state[i] + beta * noise[i]
+            rho = np.exp(-a * dt)
+            self._state[i] = (rho * self._state[i]
+                              + sigmas[i] * np.sqrt(max(1.0 - rho ** 2, 0.0)) * noise[i])
 
         self._velocity = self._state + self.mean_wind
         return self._velocity.copy()

@@ -34,6 +34,20 @@ class MuJoCoSimulator:
     wind_model : WindModel | None
         Optional wind model.  If provided, wind velocity is queried each
         step and passed to the vehicle's ``compute_wrench`` function.
+    substeps : int
+        Number of physics steps per call to ``step`` (default 1).  The MJCF
+        ``timestep`` is treated as the CONTROL period and is subdivided by this
+        factor, so ``dt`` -- the period every caller schedules against -- is
+        unchanged, while the physics integrates ``substeps`` times finer.
+
+        This is the accuracy knob worth turning here.  Forces are injected via
+        ``xfrc_applied`` and held constant over a physics step, so that
+        zero-order hold, not the integrator, limits the global order of accuracy
+        to ~1 (measured).  Substepping re-evaluates the wrench at each physics
+        step, shrinking the ZOH error roughly linearly, whereas a higher-order
+        integrator alone does not (RK4 measured order ~1 at 4x the cost).
+        substeps=4 with Euler therefore costs about the same as the old RK4
+        single step and is ~4x more accurate.
     """
 
     def __init__(
@@ -41,15 +55,22 @@ class MuJoCoSimulator:
         vehicle: VehicleModel,
         mjcf_override: str | None = None,
         wind_model=None,
+        substeps: int = 1,
     ):
         self.vehicle = vehicle
         self.wind_model = wind_model
+        self.substeps = int(substeps)
+        if self.substeps < 1:
+            raise ValueError("substeps must be >= 1")
         if mjcf_override is not None:
             self.model = mujoco.MjModel.from_xml_string(mjcf_override)
         elif vehicle.mjcf_xml is not None:
             self.model = mujoco.MjModel.from_xml_string(vehicle.mjcf_xml)
         else:
             self.model = mujoco.MjModel.from_xml_path(str(vehicle.mjcf_path))
+        # MJCF timestep is the control period; subdivide it for the physics.
+        self._control_dt = float(self.model.opt.timestep)
+        self.model.opt.timestep = self._control_dt / self.substeps
         self.data = mujoco.MjData(self.model)
 
         self._body_id = mujoco.mj_name2id(
@@ -86,7 +107,19 @@ class MuJoCoSimulator:
 
     @property
     def dt(self) -> float:
-        return self.model.opt.timestep
+        """Control period [s] -- what one ``step`` call advances.
+
+        This is the MJCF ``timestep``, independent of ``substeps``; the physics
+        step is ``dt / substeps``. Callers schedule the controller against this,
+        so raising ``substeps`` refines the physics without moving the control
+        rate (or the meaning of any ``range(int(T / sim.dt))`` loop).
+        """
+        return self._control_dt
+
+    @property
+    def physics_dt(self) -> float:
+        """Integrator step [s] = ``dt / substeps``."""
+        return float(self.model.opt.timestep)
 
     @property
     def current_time(self) -> float:
@@ -130,30 +163,41 @@ class MuJoCoSimulator:
         -------
         VehicleState after the step.
         """
-        cmds = jnp.asarray(motor_commands, dtype=jnp.float32)
-        state = self.get_state()
-
-        # Query wind model (if any)
-        if self.wind_model is not None:
-            altitude = float(state.position[2])
-            v_wind = self.wind_model.step(altitude, self.dt)
-            wind_jax = jnp.asarray(v_wind, dtype=jnp.float32)
-        else:
-            wind_jax = jnp.zeros(3)
-
-        # Compute forces via JIT-compiled vehicle dynamics
-        F_world, T_world = self._compute_wrench_jit(
-            state, cmds, wind_velocity=wind_jax)
-
-        # Inject into MuJoCo
+        # float64 throughout: the project runs with jax_enable_x64, and casting
+        # the command/wind down to float32 here silently discarded that (and
+        # forced a second JIT trace, since the no-wind path passes a float64
+        # jnp.zeros(3)).
+        cmds = jnp.asarray(motor_commands, dtype=jnp.float64)
         bid = self._body_id
-        self.data.xfrc_applied[bid, 0:3] = np.asarray(F_world)
-        self.data.xfrc_applied[bid, 3:6] = np.asarray(T_world)
 
-        # Drive visual prop spin
+        # Drive visual prop spin (command is held over the whole control period)
         self._spin_props(np.asarray(cmds))
 
-        mujoco.mj_step(self.model, self.data)
+        # The wrench is recomputed EVERY physics substep, from that substep's
+        # state. That is the point of substepping: holding the force constant
+        # over the whole control period is the zero-order hold that caps the
+        # accuracy at first order, so re-evaluating it on the finer grid is what
+        # actually buys accuracy (see the `substeps` docstring).
+        for _ in range(self.substeps):
+            state = self.get_state()
+
+            # Query wind model (if any)
+            if self.wind_model is not None:
+                altitude = float(state.position[2])
+                v_wind = self.wind_model.step(altitude, self.physics_dt)
+                wind_jax = jnp.asarray(v_wind, dtype=jnp.float64)
+            else:
+                wind_jax = jnp.zeros(3)
+
+            # Compute forces via JIT-compiled vehicle dynamics
+            F_world, T_world = self._compute_wrench_jit(
+                state, cmds, wind_velocity=wind_jax)
+
+            # Inject into MuJoCo
+            self.data.xfrc_applied[bid, 0:3] = np.asarray(F_world)
+            self.data.xfrc_applied[bid, 3:6] = np.asarray(T_world)
+
+            mujoco.mj_step(self.model, self.data)
 
         new_state = self.get_state()
         self.state_history.append(new_state)

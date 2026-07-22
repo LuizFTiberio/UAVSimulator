@@ -19,10 +19,28 @@ weight) while holding altitude. "model" is the aerodynamically-blind thrust-
 vector loop, which keeps thrust high and climbs -- run it to see the contrast.
 "analytic" is the paper's fitted Eq. 28-33 backend (the sim2real path).
 
+Wind (--wind / --turbulence) is applied to the SIMULATOR, and the same wind
+vector is handed to the controller each step. That is deliberate and it is a
+cheat: a real Cyclone has no wind sensor and would have to estimate the wind
+(or, equivalently, reconstruct sideslip from the lateral accelerometer, paper
+Eq. 13-16). It is the same ground-truth shortcut estimate_sideslip() already
+takes -- fine for sim/RL, flagged here so it is not mistaken for a wind
+observer. Drop the wind_velocity= argument below to see the blind case.
+
+Note the mission does NOT currently recover hover cleanly in a strong steady
+wind: the elevons saturate in the final hover leg and the INDI allocator starts
+jumping between saturated vertices. --zeta-f raises the propwash elevon
+effectiveness (the only source of hover elevon authority, see
+default_phi_wing_params) to give it more control power; the default 0.3 is a
+placeholder, not a Cyclone measurement, so raising it for this demo is honest.
+
 Run:
     python examples/tailsitter_mission_demo.py            # live viewer + plots
     python examples/tailsitter_mission_demo.py --headless # plots only (no display)
     python examples/tailsitter_mission_demo.py --outer model    # blind outer loop
+    python examples/tailsitter_mission_demo.py --wind 5 0 0     # 5 m/s steady wind
+    python examples/tailsitter_mission_demo.py --wind 4 2 0 --turbulence light
+    python examples/tailsitter_mission_demo.py --wind 5 0 0 --zeta-f 0.6
 
 Produces tailsitter_mission.png (trajectory, altitude, pitch, speed, actuator
 saturation, sideslip) mirroring the paper's Fig. 16-19.
@@ -47,6 +65,8 @@ from uavsim.controllers.tailsitter_indi import (
 from uavsim.controllers.tailsitter_guidance import MissionGuidance, roadmap_mission
 from uavsim.viz.viewer import SimulationVisualizer
 from uavsim.viz.plotting import plot_tailsitter_mission
+from uavsim.disturbances.wind import (
+    ConstantWind, light_turbulence, moderate_turbulence, severe_turbulence)
 
 # ── mission parameters ───────────────────────────────────────────────────────
 ALTITUDE = 10.0
@@ -60,8 +80,20 @@ def _hover_quat() -> np.ndarray:
     return np.concatenate([[np.cos(angle / 2)], np.sin(angle / 2) * axis])
 
 
+def _build_wind(mean_wind, turbulence: str, seed: int):
+    """Wind model from the CLI options, or None for still air."""
+    mean = np.asarray(mean_wind, dtype=float)
+    if turbulence == "none":
+        return ConstantWind(mean) if np.any(mean) else None
+    factory = {"light": light_turbulence, "moderate": moderate_turbulence,
+               "severe": severe_turbulence}[turbulence]
+    return factory(mean_wind=mean, seed=seed)
+
+
 def main(headless: bool = False, real_time_factor: float = 1.0,
-         outer: str = "guidance"):
+         outer: str = "guidance", wind=(0.0, 0.0, 0.0),
+         turbulence: str = "none", seed: int = 0, zeta_f: float = 0.3,
+         substeps: int = 4):
     if headless:   # no display: force a non-interactive matplotlib backend
         import matplotlib
         matplotlib.use("Agg")
@@ -71,8 +103,10 @@ def main(headless: bool = False, real_time_factor: float = 1.0,
     print(f"   outer loop: {outer}")
     print("=" * 66)
 
-    params = tailsitter_params()
-    sim = MuJoCoSimulator(tailsitter(params=params))
+    params = tailsitter_params(zeta_f_pitch=zeta_f)
+    wind_model = _build_wind(wind, turbulence, seed)
+    sim = MuJoCoSimulator(tailsitter(params=params), wind_model=wind_model,
+                          substeps=substeps)
     I = composite_inertia_from_model(sim.model)
     ctrl_kw = dict(mass=sim.total_mass,
                    use_sideslip_control=True)   # coordinated turn (Phase B)
@@ -93,6 +127,11 @@ def main(headless: bool = False, real_time_factor: float = 1.0,
     print(f"  Altitude     : {ALTITUDE} m")
     print(f"  Turn rate    : {TURN_RATE} rad/s")
     print(f"  Mission time : {guid.total_time:.1f} s   ({len(legs)} legs)")
+    print(f"  Mean wind    : {np.asarray(wind, dtype=float)} m/s"
+          f"   turbulence: {turbulence}")
+    print(f"  zeta_f pitch : {zeta_f}  (hover elevon authority; 0.3 = default placeholder)")
+    print(f"  control dt   : {sim.dt * 1e3:.2f} ms    physics dt: "
+          f"{sim.physics_dt * 1e6:.0f} us  ({substeps} substeps, Euler)")
     print("=" * 66 + "\n")
 
     # spawn at hover
@@ -121,11 +160,15 @@ def main(headless: bool = False, real_time_factor: float = 1.0,
     try:
         for k in range(n_steps):
             ref = guid.step(dt)
+            # Hand the controller the CURRENT wind (see module docstring: this is
+            # ground truth, not an estimate). sim.wind_velocity is the vector the
+            # simulator used on the previous step, and is zeros with no wind model.
             cmd = ctrl.update(state, jnp.asarray(ref.position),
                               setpoint_velocity=ref.velocity,
                               accel_feedforward=ref.acceleration,
                               desired_yaw=ref.yaw,
-                              yaw_rate_ff=ref.yaw_rate_ff)
+                              yaw_rate_ff=ref.yaw_rate_ff,
+                              wind_velocity=sim.wind_velocity)
             state = sim.step(cmd)
             commands.append(np.asarray(cmd, dtype=float))
             references.append(ref)
@@ -180,5 +223,25 @@ if __name__ == "__main__":
     ap.add_argument("--outer", choices=["guidance", "model", "analytic"],
                     default="guidance",
                     help="outer-loop mode (default: guidance INDI)")
+    ap.add_argument("--wind", type=float, nargs=3, metavar=("VX", "VY", "VZ"),
+                    default=[0.0, 0.0, 0.0],
+                    help="steady world-frame wind [m/s] (also the mean wind "
+                         "under --turbulence). Default: still air.")
+    ap.add_argument("--turbulence",
+                    choices=["none", "light", "moderate", "severe"],
+                    default="none",
+                    help="Dryden turbulence on top of --wind (default: none)")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="RNG seed for the turbulence (default: 0)")
+    ap.add_argument("--zeta-f", type=float, default=0.3, dest="zeta_f",
+                    help="propwash elevon effectiveness = hover elevon "
+                         "authority (default 0.3, a placeholder; try 0.6)")
+    ap.add_argument("--substeps", type=int, default=4,
+                    help="physics steps per 1 ms control step (default 4 = "
+                         "250 us physics). Error falls ~linearly with this; in "
+                         "this demo the controller dominates the runtime, so 4 "
+                         "costs only ~17%% more wall time than 1.")
     args = ap.parse_args()
-    main(headless=args.headless, real_time_factor=args.rtf, outer=args.outer)
+    main(headless=args.headless, real_time_factor=args.rtf, outer=args.outer,
+         wind=args.wind, turbulence=args.turbulence, seed=args.seed,
+         zeta_f=args.zeta_f, substeps=args.substeps)

@@ -25,7 +25,29 @@
 
   <compiler inertiafromgeom="auto" angle="radian"/>
 
-  <option timestep="0.001" gravity="0 0 -9.81" integrator="RK4"/>
+  <!--
+    timestep here is the CONTROL period. MuJoCoSimulator(substeps=N) subdivides
+    it into N physics steps, so the controller keeps running at 1 kHz (the rate
+    the INDI loop was tuned and validated at) while the physics integrates finer.
+
+    Euler, not RK4, on purpose. Forces are injected as xfrc_applied and held
+    constant across a physics step, so the zero-order hold -- not the integrator
+    -- sets the global order of accuracy: measured convergence with RK4 was
+    order ~1, i.e. RK4's four dynamics evaluations per step bought no accuracy.
+    Dropping to Euler therefore costs nothing in accuracy. It is only a modest
+    speedup, though, NOT the 4x the stage count suggests: MuJoCo's integration
+    is a few percent of the runtime here (0.003 s vs 0.007 s per 500 steps,
+    Euler vs RK4) and the JAX wrench evaluation dominates, so the measured
+    end-to-end saving is ~20%. The real reason to prefer Euler is that it frees
+    the budget for substeps, which DO shrink the ZOH error ~linearly.
+
+    True 4th-order coupling would need the wrench re-evaluated inside each RK4
+    stage via mjcb_control; that works (measured ~9000x lower error at 1 ms, for
+    ~the same wall time) but it is a process-global Python callback, so it is
+    incompatible with mjx / batched GPU rollouts and cannot be vmapped -- ruled
+    out here because parallel-env RL is a near-term goal for this repo.
+  -->
+  <option timestep="0.001" gravity="0 0 -9.81" integrator="Euler"/>
 
   <visual>
     <headlight ambient="0.4 0.4 0.4" diffuse="0.6 0.6 0.6" specular="0.1 0.1 0.1"/>

@@ -186,6 +186,7 @@ def default_phi_wing_params(
     Cmde: float = -1.28,
     Clda: float = 0.178,
     phi_param: float = 1.0,
+    zeta_f_pitch: float = 0.3,
 ) -> PhiWingParams:
     """Default phi-theory wing params: 2 sections (left/right), 2 propellers.
 
@@ -199,6 +200,15 @@ def default_phi_wing_params(
       - delta_r (per-section aero_center x-offset): the ELEVON's own
         position behind CG, for the PROPWASH mechanism -- unchanged from
         before, still the only elevon authority source at hover.
+
+    zeta_f_pitch scales that propwash mechanism (phi-theory Eq. 95,
+    Phi_fv @ (I - delta*[zeta_f x])), i.e. it IS the hover elevon authority:
+    the freestream elevon derivatives (Cmde/Clda) need V>0 and contribute
+    nothing at hover. Still a placeholder, not a Cyclone measurement, so it is
+    exposed here rather than buried -- raising it is the honest knob for "give
+    this airframe more pitch control at hover" until real data exists. Relevant
+    because the elevons saturate in the hover-recovery leg under wind, which is
+    what drives the INDI allocator to jump between saturated vertices.
       - wing_ac_offset (whole-vehicle, geometric Phi_mv): the WING's own
         aerodynamic-center offset from CG, for the FREESTREAM static-
         margin term. Zero here (CG at 25% chord = classical thin-airfoil
@@ -217,7 +227,7 @@ def default_phi_wing_params(
         Clp=Clp, Cmq=Cmq, Cnr=Cnr, Cmde=Cmde, Clda=Clda,
         wingspan=wingspan, chord=chord,
         wing_ac_offset=jnp.array([wing_ac_offset, 0.0, 0.0]),
-        zeta_f=jnp.array([0.0, 0.3, 0.0]),  # propwash elevon effectiveness, still placeholder
+        zeta_f=jnp.array([0.0, zeta_f_pitch, 0.0]),  # propwash elevon effectiveness, still placeholder
         phi_param=phi_param,
     )
     propellers = (
@@ -245,6 +255,7 @@ def tailsitter_params(
     max_elevon: float = jnp.radians(25.0),
     phi_wing: PhiWingParams | None = None,
     bem_table: BEMTableParams | None = None,
+    zeta_f_pitch: float = 0.3,
 ) -> TailsitterParams:
     """Create tail-sitter parameters.
 
@@ -275,7 +286,8 @@ def tailsitter_params(
     ])
 
     if phi_wing is None:
-        phi_wing = default_phi_wing_params(prop_y_offset=prop_y_offset)
+        phi_wing = default_phi_wing_params(prop_y_offset=prop_y_offset,
+                                           zeta_f_pitch=zeta_f_pitch)
 
     return TailsitterParams(
         mass=mass,

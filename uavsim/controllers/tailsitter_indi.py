@@ -82,8 +82,23 @@ from uavsim.controllers.tailsitter_hover import attitude_error
 U_MIN = np.array([0.0, 0.0, -1.0, -1.0])   # [thr_L, thr_R, elevon_L, elevon_R]
 U_MAX = np.array([1.0, 1.0, 1.0, 1.0])
 
+# Idle throttle floor. With T = kf*omega^2 and omega = throttle*max_omega, the
+# thrust derivative dT/dthrottle = 2*kf*max_omega^2*throttle is EXACTLY ZERO at
+# zero throttle -- so a propeller commanded fully off contributes an identically
+# zero column to G, making the 4x4 effectiveness exactly rank-deficient and the
+# allocation's inverse meaningless. Measured on the wind mission: cond(G) reached
+# 4.6e11 (null direction exactly the dead throttle's axis) over 241 steps, all
+# with a throttle at 0; a floor takes that to a single step. The cliff is sharp,
+# not gradual -- cond is already ~25 at throttle 0.02 and only diverges at
+# exactly 0 -- so this is cheap insurance rather than a tuning knob. Also
+# physically right: ESCs should not stop a prop mid-flight.
+# NOTE this does NOT remove the actuator-command spikes; those are dominated by
+# elevon saturation in the hover-recovery leg (a control-authority problem), and
+# flooring the throttle moved them by only 2 of 39 events.
+MIN_THROTTLE = 0.05
+
 # Below this forward (body-x) airspeed the sideslip angle is meaningless
-# (atan2 of a lateral component over ~zero forward speed is garbage) and the
+# (a lateral component over ~zero forward speed carries no information) and the
 # g*tan(phi)/V coordinated-turn term blows up, so the sideslip loop holds its
 # heading below it. 2 m/s is comfortably into forward flight for this vehicle.
 V_SIDESLIP_MIN = 2.0
@@ -129,7 +144,17 @@ def estimate_sideslip(
     (body y -- the propellers sit at y=+/-0.3), i.e. the airflow hitting the
     wing edge-on rather than head-on:
 
-        beta = atan2(v_body_y, v_body_x)
+        beta = asin(v_body_y / V)
+
+    Note this is the standard asin-over-TOTAL-airspeed definition, NOT
+    atan2(v_body_y, v_body_x). The two agree exactly whenever v_body_z = 0 and
+    v_body_x > 0 (so they are interchangeable in trimmed forward flight), but
+    atan2 is discontinuous: it wraps through +/-180 deg the instant v_body_x
+    goes negative, and at hover -- where body-x points UP, so v_body_x is just
+    the vertical airspeed hovering around zero -- it flips between ~0 and ~+/-180
+    every time that crosses. That produced exactly the 360 deg beta spikes seen
+    when logging sideslip through a hover leg or in wind. asin is bounded to
+    +/-90 deg and continuous through v_body_x = 0, so it never wraps.
 
     This uses ground-truth simulator state (roadmap Phase B step 1, approach a
     -- "cheating" relative to a real vehicle but exact and fine for sim/RL). A
@@ -138,14 +163,14 @@ def estimate_sideslip(
     sim2real transfer matters.
 
     beta is only meaningful in forward flight; the caller gates on
-    v_body[0] > V_SIDESLIP_MIN (below that, forward speed ~0 makes the atan2
-    ill-defined).
+    v_body[0] > V_SIDESLIP_MIN (below that there is no meaningful "forward" for
+    the flow to slip away from).
     """
     R = np.asarray(quat_to_rotation_matrix(state.quaternion))
     v_air_world = np.asarray(state.velocity, dtype=float) - np.asarray(wind_velocity, dtype=float)
     v_body = R.T @ v_air_world
     V = float(np.linalg.norm(v_body))
-    beta = float(np.arctan2(v_body[1], v_body[0]))
+    beta = float(np.arcsin(np.clip(v_body[1] / max(V, 1e-6), -1.0, 1.0)))
     return beta, V, v_body
 
 
@@ -490,8 +515,14 @@ class TailsitterINDIController:
         use_sideslip_control: bool = False,
         mass: float | None = None,
         Wv: np.ndarray | None = None,
+        min_throttle: float = MIN_THROTTLE,
     ):
         self.params = params
+        # Actuator bounds, with the idle-throttle floor applied (see
+        # MIN_THROTTLE: a fully-off propeller zeroes its own column of G).
+        self.u_min = U_MIN.copy()
+        self.u_min[:2] = float(min_throttle)
+        self.u_max = U_MAX.copy()
         self.dt = float(dt)
         self.use_wls = use_wls
         self.use_indi_outer = use_indi_outer
@@ -678,7 +709,22 @@ class TailsitterINDIController:
                     self.pitch_scaling))
             dv = self.guidance_gain * (np.linalg.pinv(Gp) @ (a_ref - self.a_meas_f))
             phi_c = float(np.clip(float(phi0) + dv[0], np.radians(-60.0), np.radians(60.0)))
-            theta_c = float(np.clip(float(theta0) + dv[1], 0.0, np.radians(100.0)))
+            # theta must be free to go NEGATIVE (thrust axis tilted BACKWARDS,
+            # against the heading). It was clipped to [0, 100deg], which confines
+            # the commanded thrust axis to the half-space b1.h >= 0: the vehicle
+            # could then only ever accelerate along +heading. That is invisible on
+            # the nominal mission (guidance rotates the heading onto the path, so
+            # every commanded accel is forward), but any disturbance pushing it
+            # downrange -- notably a headwind at hover, where the heading is pinned
+            # -- demands a backward tilt, gets clipped to theta=0, and the
+            # unrepresentable demand leaks through the pinv into the thrust
+            # channel instead: the vehicle drifts downwind AND climbs. Measured on
+            # a 3 m/s hover headwind: 12.9 m position error and a 3.8 m unwanted
+            # climb, vs 0.00 m once theta may go negative.
+            # Bounds are +/-90deg to match guidance_extract_bank_pitch, whose
+            # arcsin(b1.h) baseline cannot represent |theta| > 90deg anyway (the
+            # old 100deg upper bound was already unreachable in the round trip).
+            theta_c = float(np.clip(float(theta0) + dv[1], np.radians(-90.0), np.radians(90.0)))
             T_des = float(max(T0 + dv[2], 0.0))
             R_des = guidance_attitude(phi_c, theta_c, heading)
             self.outer_theta, self.outer_phi, self.outer_T = theta_c, phi_c, T_des
@@ -717,14 +763,14 @@ class TailsitterINDIController:
         nu_inc = nu - y_meas
 
         # ── allocation: solve for the increment du, bounds about u_f ────────
-        du_min = U_MIN - self.u_f
-        du_max = U_MAX - self.u_f
+        du_min = self.u_min - self.u_f
+        du_max = self.u_max - self.u_f
         if self.use_wls:
             du, _ = wls_alloc(nu_inc, G, du_min, du_max, Wv=self.Wv,
                               u_guess=np.zeros(4))
         else:
             du = np.clip(np.linalg.pinv(G) @ nu_inc, du_min, du_max)
 
-        u_c = np.clip(self.u_f + du, U_MIN, U_MAX)
+        u_c = np.clip(self.u_f + du, self.u_min, self.u_max)
         self.u_applied = u_c
         return jnp.asarray(u_c)
